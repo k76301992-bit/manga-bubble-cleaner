@@ -7,6 +7,31 @@ export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
+export function ensurePublicImageUrl(value: string) {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("الرابط غير صالح."); }
+  const host = url.hostname.toLowerCase();
+  if (!["http:", "https:"].includes(url.protocol) || host === "localhost" || host.endsWith(".local") || /^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) throw new Error("يجب أن يكون الرابط عامًا وآمنًا.");
+  return url;
+}
+
+export async function importImageFromUrl(value: string) {
+  const url = ensurePublicImageUrl(value);
+  const response = await fetch(url, { signal: AbortSignal.timeout(15_000), redirect: "follow" });
+  if (!response.ok) throw new Error("تعذر تنزيل الصورة من الرابط.");
+  const mimeType = (response.headers.get("content-type") ?? "").split(";")[0].toLowerCase();
+  if (!SUPPORTED_IMAGE_TYPES.has(mimeType)) throw new Error("يجب أن يقود الرابط إلى صورة PNG أو JPG أو WebP مباشرة.");
+  const size = Number(response.headers.get("content-length") ?? 0);
+  if (size > MAX_INPUT_BYTES) throw new Error("الصورة في الرابط أكبر من 20 ميغابايت.");
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length || buffer.length > MAX_INPUT_BYTES) throw new Error("الصورة في الرابط غير صالحة أو أكبر من الحد المسموح.");
+  const meta = await sharp(buffer).metadata();
+  if (!meta.width || !meta.height) throw new Error("تعذر قراءة أبعاد الصورة من الرابط.");
+  const fileName = decodeURIComponent(url.pathname.split("/").pop() || "linked-manhwa-page.png").replace(/[^a-zA-Z0-9._-]/g, "-");
+  const stored = await storagePut(`manga-bubble-cleaner/imports/${Date.now()}-${fileName}`, buffer, mimeType);
+  return { sourceUrl: stored.url, fileName, mimeType, width: meta.width, height: meta.height, fileSize: buffer.length };
+}
+
 export function buildCleaningPrompt(quality: CleaningQuality) {
   const qualityInstruction = {
     balanced:

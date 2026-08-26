@@ -1,4 +1,4 @@
-import { File } from "expo-file-system/next";
+import { Directory, File, Paths } from "expo-file-system/next";
 import { Platform } from "react-native";
 
 const MAX_SOURCE_BYTES = 20 * 1024 * 1024;
@@ -11,22 +11,23 @@ export async function readImageAsDataUrl(uri: string, mimeType: string, knownSiz
   if (Platform.OS === "web") {
     const response = await fetch(uri);
     const blob = await response.blob();
-    if (blob.size > MAX_SOURCE_BYTES) {
-      throw new Error("الصورة أكبر من 20 ميغابايت. اختر نسخة أصغر قليلًا.");
-    }
-    const base64 = await new Promise<string>((resolve, reject) => {
+    if (blob.size > MAX_SOURCE_BYTES) throw new Error("الصورة أكبر من 20 ميغابايت. اختر نسخة أصغر قليلًا.");
+    return await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();
       reader.onerror = () => reject(new Error("تعذر قراءة الصورة المختارة."));
       reader.onload = () => resolve(String(reader.result));
       reader.readAsDataURL(blob);
     });
-    return base64;
   }
 
-  const file = new File(uri);
-  if (file.size > MAX_SOURCE_BYTES) {
-    throw new Error("الصورة أكبر من 20 ميغابايت. اختر نسخة أصغر قليلًا.");
+  let file = new File(uri);
+  if (/^https?:\/\//i.test(uri)) {
+    const cacheDir = new Directory(Paths.cache, "bubbleclean-imports");
+    cacheDir.create({ idempotent: true, intermediates: true });
+    const cacheFile = new File(cacheDir, `source-${Date.now()}.${mimeType.split("/")[1] ?? "img"}`);
+    const downloaded = await File.downloadFileAsync(uri, cacheFile, { idempotent: true });
+    file = new File(downloaded.uri);
   }
-  const base64 = await file.base64();
-  return `data:${mimeType};base64,${base64}`;
+  if (file.size > MAX_SOURCE_BYTES) throw new Error("الصورة أكبر من 20 ميغابايت. اختر نسخة أصغر قليلًا.");
+  return `data:${mimeType};base64,${await file.base64()}`;
 }

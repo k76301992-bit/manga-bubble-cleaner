@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { buildCleaningPrompt, decodeImageDataUrl } from "../server/manga-bubble-cleaner";
+import { buildCleaningPrompt, decodeImageDataUrl, ensurePublicImageUrl } from "../server/manga-bubble-cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("builds a high-detail prompt that preserves artwork and limits edits to dialogue text", () => {
@@ -32,5 +32,10 @@ describe("manga bubble cleanup safeguards", () => {
       keepOriginalDimensions: false,
       saveResultsToGallery: false,
     });
+  });
+
+  it("accepts public HTTPS image URLs but blocks local network destinations", () => {
+    expect(ensurePublicImageUrl("https://cdn.example.com/page.webp").hostname).toBe("cdn.example.com");
+    expect(() => ensurePublicImageUrl("http://127.0.0.1:3000/private.png")).toThrow("يجب أن يكون الرابط عامًا وآمنًا.");
   });
 });
