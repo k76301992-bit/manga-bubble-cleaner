@@ -35,6 +35,7 @@ export const appRouter = router({
     cleanMangaTile: publicProcedure.input(z.object({
       sourceKey: z.string().min(1).max(512), fileName: z.string().min(1).max(255), quality: z.enum(["balanced", "preserve-detail", "maximum-detail"]),
       width: z.number().int().min(1).max(12000), height: z.number().int().min(1).max(30000), tileIndex: z.number().int().min(0).max(100),
+      maskAdjustments: z.array(z.object({ mode: z.enum(["include", "exclude"]), points: z.array(z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1) })).min(2).max(128) })).max(32).optional(),
     })).mutation(async ({ input, ctx }) => {
       const result = await cleanMangaTile(input);
       return { ...result, resultUrl: absoluteAssetUrl(ctx.req, result.resultUrl) };

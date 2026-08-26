@@ -5,6 +5,7 @@ import sharp from "sharp";
 
 export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
 type BubbleTextRegion = { x: number; y: number; width: number; height: number };
+type ManualMaskAdjustment = { mode: "include" | "exclude"; points: Array<{ x: number; y: number }> };
 
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
@@ -59,12 +60,12 @@ function cleanFileName(fileName: string) {
   return fileName.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").slice(0, 96) || "manga-page.png";
 }
 
-async function detectBubbleTextRegions(tileUrl: string, width: number, height: number): Promise<BubbleTextRegion[]> {
+async function detectRegions(tileUrl: string, width: number, height: number, instruction: string): Promise<BubbleTextRegion[]> {
   const result = await invokeLLM({
     model: "gemini-3.1-pro-preview",
     maxTokens: 2200,
     messages: [{ role: "user", content: [
-      { type: "text", text: `Find every readable dialogue or narration text group inside speech bubbles or caption boxes in this manga crop, including bubbles with white, yellow, red, black, translucent, or patterned fills. Ignore decorative sound effects, logos, panel borders, and text outside bubbles. Return JSON only: an array of objects in the form {"box_2d":[ymin,xmin,ymax,xmax],"label":"dialogue"}, where each coordinate is normalized from 0 to 1000. Use a box whenever dialogue text is visible; do not omit colored bubbles.` },
+      { type: "text", text: `${instruction} Return JSON only: an array of objects in the form {"box_2d":[ymin,xmin,ymax,xmax],"label":"dialogue"}, where each coordinate is normalized from 0 to 1000. Make every box enclose letters only, never the bubble outline or tail.` },
       { type: "image_url", image_url: { url: tileUrl, detail: "high" } },
     ] }], responseFormat: { type: "json_object" },
   });
@@ -87,6 +88,14 @@ async function detectBubbleTextRegions(tileUrl: string, width: number, height: n
   } catch { return []; }
 }
 
+async function detectBubbleTextRegions(tileUrl: string, width: number, height: number): Promise<BubbleTextRegion[]> {
+  const generalInstruction = "Find every readable dialogue or narration text group inside speech bubbles or caption boxes in this manga crop, including bubbles with white, yellow, red, black, translucent, or patterned fills. Ignore decorative sound effects, logos, panel borders, and text outside bubbles. Use a box whenever dialogue text is visible; do not omit colored bubbles.";
+  const coloredRecoveryInstruction = "Perform a focused recovery pass. Find dialogue lettering inside dark, black, red, colored, translucent, or gradient-filled speech bubbles and caption boxes in this manga crop, including white lettering on dark fills. Do not select sound effects, logos, panel borders, or lettering outside a closed bubble. Include the text even when its bubble is over dramatic artwork.";
+  const general = await detectRegions(tileUrl, width, height, generalInstruction);
+  const coloredRecovery = await detectRegions(tileUrl, width, height, coloredRecoveryInstruction);
+  return uniqueRegions([...general, ...coloredRecovery]);
+}
+
 function uniqueRegions(regions: BubbleTextRegion[]) {
   return regions.filter((region, index, all) => !all.slice(0, index).some((other) => {
     const ox = Math.max(0, Math.min(region.x + region.width, other.x + other.width) - Math.max(region.x, other.x));
@@ -99,20 +108,39 @@ type Pixel = [number, number, number, number];
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const mix = (a: Pixel, b: Pixel, amount: number): Pixel => [a[0] + (b[0] - a[0]) * amount, a[1] + (b[1] - a[1]) * amount, a[2] + (b[2] - a[2]) * amount, 255];
 
-/** Rebuilds only high-contrast letter pixels from the bubble's own surrounding colors. */
+/** Rebuilds only a text mask, sampling the bubble's local colour gradient around its text group. */
 export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
   const output = Buffer.from(source);
   const read = (x: number, y: number): Pixel => { const offset = (y * width + x) * 4; return [source[offset], source[offset + 1], source[offset + 2], source[offset + 3]]; };
   const write = (x: number, y: number, color: Pixel) => { const offset = (y * width + x) * 4; output[offset] = Math.round(color[0]); output[offset + 1] = Math.round(color[1]); output[offset + 2] = Math.round(color[2]); output[offset + 3] = source[offset + 3]; };
+  const averageAt = (x: number, y: number, direction: "x" | "y"): Pixel => {
+    const samples: Pixel[] = [];
+    for (let offset = -2; offset <= 2; offset += 1) samples.push(direction === "x" ? read(clamp(x + offset, 0, width - 1), y) : read(x, clamp(y + offset, 0, height - 1)));
+    return [samples.reduce((sum, color) => sum + color[0], 0) / samples.length, samples.reduce((sum, color) => sum + color[1], 0) / samples.length, samples.reduce((sum, color) => sum + color[2], 0) / samples.length, 255];
+  };
   for (const region of uniqueRegions(regions)) {
-    const x0 = clamp(region.x - 2, 3, width - 4); const y0 = clamp(region.y - 2, 3, height - 4);
-    const x1 = clamp(region.x + region.width + 2, x0 + 1, width - 4); const y1 = clamp(region.y + region.height + 2, y0 + 1, height - 4);
+    const x0 = clamp(region.x - 4, 6, width - 7); const y0 = clamp(region.y - 4, 6, height - 7);
+    const x1 = clamp(region.x + region.width + 4, x0 + 1, width - 7); const y1 = clamp(region.y + region.height + 4, y0 + 1, height - 7);
+    const boxWidth = x1 - x0 + 1; const boxHeight = y1 - y0 + 1;
+    const mask = new Uint8Array(boxWidth * boxHeight);
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
-      const horizontal = mix(read(x0 - 3, y), read(x1 + 3, y), (x - x0) / Math.max(1, x1 - x0));
-      const vertical = mix(read(x, y0 - 3), read(x, y1 + 3), (y - y0) / Math.max(1, y1 - y0));
-      const target: Pixel = [(horizontal[0] + vertical[0]) / 2, (horizontal[1] + vertical[1]) / 2, (horizontal[2] + vertical[2]) / 2, 255];
-      const current = read(x, y); const contrast = Math.hypot(current[0] - target[0], current[1] - target[1], current[2] - target[2]);
-      if (contrast > 34) write(x, y, mix(current, target, contrast > 112 ? 1 : 0.9));
+      const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
+      const vertical = mix(averageAt(x, y0 - 4, "x"), averageAt(x, y1 + 4, "x"), (y - y0) / Math.max(1, y1 - y0));
+      const backdrop = mix(horizontal, vertical, 0.35);
+      const current = read(x, y);
+      const contrast = Math.hypot(current[0] - backdrop[0], current[1] - backdrop[1], current[2] - backdrop[2]);
+      if (contrast > 28) mask[(y - y0) * boxWidth + x - x0] = 1;
+    }
+    const expanded = new Uint8Array(mask);
+    for (let y = 2; y < boxHeight - 2; y += 1) for (let x = 2; x < boxWidth - 2; x += 1) {
+      if (!mask[y * boxWidth + x]) continue;
+      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) expanded[(y + dy) * boxWidth + x + dx] = 1;
+    }
+    for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
+      if (!expanded[(y - y0) * boxWidth + x - x0]) continue;
+      const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
+      const vertical = mix(averageAt(x, y0 - 4, "x"), averageAt(x, y1 + 4, "x"), (y - y0) / Math.max(1, y1 - y0));
+      write(x, y, mix(horizontal, vertical, 0.35));
     }
   }
   return output;
@@ -137,7 +165,19 @@ export async function storeMangaSource(imageDataUrl: string, fileName: string) {
   return { sourceKey: source.key, sourceUrl: source.url, mimeType };
 }
 
-export async function cleanMangaTile(input: { sourceKey: string; fileName: string; quality: CleaningQuality; width: number; height: number; tileIndex: number }) {
+export function manualRegionsForTile(adjustments: ManualMaskAdjustment[] | undefined, pageWidth: number, pageHeight: number, tileTop: number, tileHeight: number) {
+  return (adjustments ?? []).flatMap((adjustment) => {
+    if (adjustment.mode !== "include" || adjustment.points.length < 2) return [];
+    const xs = adjustment.points.map((point) => clamp(point.x, 0, 1) * pageWidth);
+    const ys = adjustment.points.map((point) => clamp(point.y, 0, 1) * pageHeight);
+    const left = Math.floor(Math.min(...xs)); const right = Math.ceil(Math.max(...xs));
+    const top = Math.floor(Math.min(...ys)); const bottom = Math.ceil(Math.max(...ys));
+    if (right - left < 8 || bottom - top < 8 || bottom <= tileTop || top >= tileTop + tileHeight) return [];
+    return [{ x: left, y: Math.max(top, tileTop) - tileTop, width: right - left, height: Math.min(bottom, tileTop + tileHeight) - Math.max(top, tileTop) }];
+  });
+}
+
+export async function cleanMangaTile(input: { sourceKey: string; fileName: string; quality: CleaningQuality; width: number; height: number; tileIndex: number; maskAdjustments?: ManualMaskAdjustment[] }) {
   const signedSource = await storageGetSignedUrl(input.sourceKey);
   const sourceResponse = await fetch(signedSource);
   if (!sourceResponse.ok) throw new Error("تعذر تنزيل الصفحة للمقطع الحالي.");
@@ -151,12 +191,14 @@ export async function cleanMangaTile(input: { sourceKey: string; fileName: strin
   const tile = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const tileBuffer = await sharp(tile.data, { raw: { width, height: currentHeight, channels: 4 } }).png().toBuffer();
   const storedTile = await storagePut(`manga-bubble-cleaner/tiles/${Date.now()}-${input.tileIndex}.png`, tileBuffer, "image/png");
-  const regions = uniqueRegions(await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight));
+  const detectedRegions = await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight);
+  const manualRegions = manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight);
+  const regions = uniqueRegions([...detectedRegions, ...manualRegions]);
   const repairedRaw = inpaintDetectedTextBoxes(tile.data, width, currentHeight, regions);
   const repairedTile = await sharp(repairedRaw, { raw: { width, height: currentHeight, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
   const finalBuffer = await sharp(sourceBuffer).composite([{ input: repairedTile, left: 0, top }]).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
   const result = await storagePut(`manga-bubble-cleaner/tile-results/${Date.now()}-${input.tileIndex}-${cleanFileName(input.fileName).replace(/\.[^.]+$/, "")}.png`, finalBuffer, "image/png");
-  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / TILE_HEIGHT), detectedRegions: regions.length, processedRegions: regions.length };
+  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / TILE_HEIGHT), detectedRegions: detectedRegions.length, manualRegions: manualRegions.length, processedRegions: regions.length };
 }
 
 export async function cleanStoredMangaBubbleImage(input: { sourceKey: string; sourceUrl?: string; fileName: string; quality: CleaningQuality; width: number; height: number; mimeType: string }) {

@@ -7,7 +7,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 import { readImageAsDataUrl } from "@/lib/image-upload";
 import { trpc } from "@/lib/trpc";
-import { QUALITY_PRESETS, type CleanerImage, type QualityPreset, type StudioProject } from "@/shared/bubble-cleaner-types";
+import { QUALITY_PRESETS, type BubbleMaskAdjustment, type CleanerImage, type QualityPreset, type StudioProject } from "@/shared/bubble-cleaner-types";
 
 type BatchContextValue = {
   images: CleanerImage[];
@@ -25,6 +25,7 @@ type BatchContextValue = {
   clearBatch: () => void;
   processBatch: () => Promise<void>;
   retryImage: (id: string) => Promise<void>;
+  applyManualCorrection: (id: string, adjustment: BubbleMaskAdjustment) => Promise<void>;
   setQuality: (quality: QualityPreset) => void;
   renameProject: (name: string) => void;
   startNewProject: (name?: string) => void;
@@ -192,7 +193,7 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
       let resultUri = image.sourceUri;
       for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
         updateImage(image.id, { status: "cleaning", progress: Math.round(18 + (tileIndex / tileCount) * 76) });
-        const result = await cleanTileMutation.mutateAsync({ sourceKey: currentKey, fileName: image.fileName, quality, width: image.width, height: image.height, tileIndex });
+        const result = await cleanTileMutation.mutateAsync({ sourceKey: currentKey, fileName: image.fileName, quality, width: image.width, height: image.height, tileIndex, maskAdjustments: image.maskAdjustments });
         currentKey = result.resultKey;
         resultUri = result.resultUrl;
       }
@@ -214,7 +215,15 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
     images, project, projects, history, quality, notice, isProcessing, completedCount,
     chooseFiles, chooseGallery, importFromUrl, removeImage: (id) => setImages((current) => current.filter((image) => image.id !== id)),
     clearBatch: () => { setImages([]); setBatchId(createId()); setNotice("أُفرغت الدفعة الحالية؛ لم يُحذف أي ملف من جهازك."); },
-    processBatch, retryImage: async (id) => { const image = images.find((item) => item.id === id); if (image) await processOne(image); }, setQuality,
+    processBatch, retryImage: async (id) => { const image = images.find((item) => item.id === id); if (image) await processOne(image); },
+    applyManualCorrection: async (id, adjustment) => {
+      const image = images.find((item) => item.id === id);
+      if (!image) return;
+      const revised = { ...image, status: "needs-review" as const, progress: 0, maskAdjustments: [...image.maskAdjustments, adjustment] };
+      setImages((current) => current.map((item) => item.id === id ? revised : item));
+      setNotice("أُضيفت منطقة تصحيح يدوي؛ يعاد تنظيفها الآن فوق الصورة الأصلية.");
+      await processOne(revised);
+    }, setQuality,
     renameProject: (name) => { const normalized = name.trim(); if (normalized) setProject((current) => ({ ...current, name: normalized })); },
     startNewProject: (name) => { setImages([]); setBatchId(createId()); setProject(newProject(name)); setNotice("بدأ مشروع جديد. أضف صفحاته من الملفات أو الرابط."); },
   }), [chooseFiles, chooseGallery, completedCount, history, images, importFromUrl, isProcessing, notice, processBatch, processOne, project, projects, quality, setQuality]);

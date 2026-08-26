@@ -11,11 +11,13 @@ import { downloadResultToCache } from "@/lib/result-export";
 
 export default function Review() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { images, retryImage } = useBatch();
+  const { images, retryImage, applyManualCorrection } = useBatch();
   const { width } = useWindowDimensions();
   const readerRef = useRef<ScrollView>(null);
   const [original, setOriginal] = useState(false);
   const [exporting, setExporting] = useState<"share" | "save" | null>(null);
+  const [manualMode, setManualMode] = useState(false);
+  const [selection, setSelection] = useState<{ x: number; y: number } | null>(null);
   const item = images.find((image) => image.id === id);
   if (!item || !item.resultUri) return null;
 
@@ -29,6 +31,26 @@ export default function Review() {
   };
 
   const getLocalResult = async () => downloadResultToCache(item.resultUri!, item.id);
+
+  const selectResidualText = (x: number, y: number) => {
+    if (!manualMode || original) return;
+    setSelection({ x: Math.max(0.07, Math.min(0.93, x / readerWidth)), y: Math.max(0.04, Math.min(0.96, y / readerHeight)) });
+  };
+
+  const applySelection = async () => {
+    if (!selection) return;
+    const halfWidth = 0.19;
+    const halfHeight = Math.min(0.028, Math.max(0.012, (readerWidth / readerHeight) * 0.19));
+    await applyManualCorrection(item.id, {
+      id: `manual-${Date.now()}`,
+      mode: "include",
+      points: [
+        { x: Math.max(0, selection.x - halfWidth), y: Math.max(0, selection.y - halfHeight) },
+        { x: Math.min(1, selection.x + halfWidth), y: Math.min(1, selection.y + halfHeight) },
+      ],
+    });
+    setManualMode(false); setSelection(null);
+  };
 
   const share = async () => {
     try {
@@ -88,9 +110,13 @@ export default function Review() {
         </View>
 
         <ScrollView ref={readerRef} style={s.reader} contentContainerStyle={s.readerContent} showsVerticalScrollIndicator>
-          <Image source={{ uri: imageUri }} style={{ width: readerWidth, height: readerHeight, backgroundColor: "#FFFFFF" }} resizeMode="stretch" />
+          <Pressable disabled={!manualMode || original} onPress={(event) => selectResidualText(event.nativeEvent.locationX, event.nativeEvent.locationY)} style={[s.imageStage, { width: readerWidth, height: readerHeight }]}>
+            <Image source={{ uri: imageUri }} style={s.readerImage} resizeMode="stretch" />
+            {manualMode && selection ? <View pointerEvents="none" style={[s.selection, { width: readerWidth * 0.38, height: (readerWidth * 0.38) / 2.5, left: readerWidth * selection.x - readerWidth * 0.19, top: readerHeight * selection.y - (readerWidth * 0.38) / 5 }]}><Text style={s.selectionText}>منطقة النص</Text></View> : null}
+          </Pressable>
         </ScrollView>
 
+        {manualMode ? <View style={s.manualPanel}><Text style={s.manualHint}>اضغط وسط النص المتبقي. الإطار يراجع منطقة الترميم قبل التنفيذ.</Text><Pressable disabled={!selection} onPress={applySelection} style={({ pressed }) => [s.manualApply, pressed && s.pressed, !selection && s.dim]}><MaterialIcons name="auto-fix-high" size={18} color="#071019" /><Text style={s.manualApplyText}>تنظيف المنطقة المحددة</Text></Pressable></View> : null}
         <Pressable onPress={changeView} style={({ pressed }) => [s.compare, pressed && s.pressed]}>
           <MaterialIcons name="compare" size={20} color="#fff" />
           <Text style={s.compareText}>{original ? "العودة إلى النتيجة النظيفة" : "مقارنة الصورة الأصلية"}</Text>
@@ -99,6 +125,9 @@ export default function Review() {
         <View style={s.buttons}>
           <Pressable disabled={Boolean(exporting)} onPress={() => retryImage(item.id)} style={({ pressed }) => [s.retry, pressed && s.pressed]}>
             <MaterialIcons name="refresh" size={20} color="#BFD4FF" />
+          </Pressable>
+          <Pressable onPress={() => { setManualMode((value) => !value); setSelection(null); }} style={({ pressed }) => [s.manualButton, manualMode && s.manualButtonActive, pressed && s.pressed]}>
+            <MaterialIcons name="edit" size={19} color="#FFFFFF" />
           </Pressable>
           <Pressable disabled={Boolean(exporting)} onPress={share} style={({ pressed }) => [s.secondary, pressed && s.pressed, Boolean(exporting) && s.dim]}>
             <MaterialIcons name="ios-share" size={20} color="#DDE9FF" /><Text style={s.secondaryText}>{exporting === "share" ? "يجهز…" : "مشاركة"}</Text>
@@ -118,9 +147,10 @@ const s = StyleSheet.create({
   eyebrow: { color: "#7B8898", fontWeight: "800", fontSize: 10, letterSpacing: 1, textAlign: "right" }, title: { color: "#fff", fontWeight: "900", fontSize: 18, textAlign: "right", marginTop: 2 },
   readerHeader: { flexDirection: "row-reverse", justifyContent: "space-between", alignItems: "center", backgroundColor: "#10151E", borderRadius: 14, paddingHorizontal: 12, paddingVertical: 9, borderWidth: 1, borderColor: "#263140" },
   readerMeta: { flexDirection: "row-reverse", alignItems: "center", gap: 5 }, readerMetaText: { color: "#99AABD", fontSize: 10, fontWeight: "700" }, modeBadge: { backgroundColor: "#27354A", borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 }, modeText: { color: "#DDE9FF", fontSize: 10, fontWeight: "800" },
-  reader: { flex: 1, minHeight: 0, borderRadius: 19, borderWidth: 1, borderColor: "#263140", backgroundColor: "#090C11" }, readerContent: { alignItems: "center", paddingVertical: 1 },
+  reader: { flex: 1, minHeight: 0, borderRadius: 19, borderWidth: 1, borderColor: "#263140", backgroundColor: "#090C11" }, readerContent: { alignItems: "center", paddingVertical: 1 }, imageStage: { position: "relative", backgroundColor: "#FFFFFF" }, readerImage: { width: "100%", height: "100%", backgroundColor: "#FFFFFF" }, selection: { position: "absolute", borderWidth: 2, borderColor: "#7DE4FF", borderRadius: 10, backgroundColor: "rgba(125,228,255,0.13)", alignItems: "center", justifyContent: "center" }, selectionText: { color: "#E6FAFF", fontSize: 10, fontWeight: "900", textShadowColor: "#000", textShadowRadius: 3 },
   compare: { height: 46, borderColor: "#34455C", borderWidth: 1, borderRadius: 14, alignItems: "center", justifyContent: "center", flexDirection: "row-reverse", gap: 8 }, compareText: { color: "#fff", fontWeight: "800", fontSize: 13 },
-  buttons: { flexDirection: "row-reverse", gap: 8, paddingBottom: 5 }, retry: { width: 48, height: 51, borderRadius: 16, backgroundColor: "#172231", alignItems: "center", justifyContent: "center" },
+  manualPanel: { borderWidth: 1, borderColor: "#3C6072", backgroundColor: "#10212B", borderRadius: 14, padding: 10, gap: 8 }, manualHint: { color: "#C8EAF2", textAlign: "right", fontSize: 11, fontWeight: "700", lineHeight: 17 }, manualApply: { height: 38, backgroundColor: "#8DEBFF", borderRadius: 10, alignItems: "center", justifyContent: "center", flexDirection: "row-reverse", gap: 6 }, manualApplyText: { color: "#071019", fontSize: 12, fontWeight: "900" },
+  buttons: { flexDirection: "row-reverse", gap: 8, paddingBottom: 5 }, retry: { width: 48, height: 51, borderRadius: 16, backgroundColor: "#172231", alignItems: "center", justifyContent: "center" }, manualButton: { width: 48, height: 51, borderRadius: 16, backgroundColor: "#172231", alignItems: "center", justifyContent: "center" }, manualButtonActive: { backgroundColor: "#285B6B", borderWidth: 1, borderColor: "#8DEBFF" },
   secondary: { flex: 1, height: 51, borderRadius: 16, backgroundColor: "#172231", alignItems: "center", justifyContent: "center", flexDirection: "row-reverse", gap: 6 }, secondaryText: { color: "#DDE9FF", fontWeight: "800", fontSize: 12 },
   primary: { flex: 1.3, height: 51, borderRadius: 16, backgroundColor: "#F8FAFC", alignItems: "center", justifyContent: "center", flexDirection: "row-reverse", gap: 6 }, primaryText: { color: "#06101C", fontWeight: "900", fontSize: 12 }, pressed: { opacity: 0.78, transform: [{ scale: 0.985 }] }, dim: { opacity: 0.55 },
 });
