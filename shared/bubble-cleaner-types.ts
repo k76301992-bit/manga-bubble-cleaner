@@ -19,6 +19,7 @@ export interface BubbleMaskAdjustment {
 export interface CleanerImage {
   id: string;
   sourceUri: string;
+  sourceKey?: string;
   fileName: string;
   mimeType: string;
   width: number;

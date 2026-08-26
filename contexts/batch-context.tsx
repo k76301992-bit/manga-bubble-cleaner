@@ -47,8 +47,9 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const [quality, setQualityState] = useState<QualityPreset>("preserve-detail");
   const [notice, setNotice] = useState("أنشئ دفعة جديدة لإضافة صفحات المانهوا.");
   const cleanMutation = trpc.image.cleanMangaBubbles.useMutation();
+  const importedCleanMutation = trpc.image.cleanImportedMangaBubbles.useMutation();
   const urlMutation = trpc.image.importFromUrl.useMutation();
-  const isProcessing = cleanMutation.isPending;
+  const isProcessing = cleanMutation.isPending || importedCleanMutation.isPending;
   const completedCount = images.filter((image) => image.status === "completed").length;
 
   useEffect(() => {
@@ -119,7 +120,7 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
     if (!normalized) throw new Error("أدخل رابطًا مباشرًا لصورة PNG أو JPG أو WebP.");
     const imported = await urlMutation.mutateAsync({ url: normalized });
     setImages((current) => [...current, {
-      id: createId(), sourceUri: imported.sourceUrl, fileName: imported.fileName, mimeType: imported.mimeType,
+      id: createId(), sourceUri: imported.sourceUrl, sourceKey: imported.sourceKey, fileName: imported.fileName, mimeType: imported.mimeType,
       width: imported.width, height: imported.height, fileSize: imported.fileSize, status: "queued", progress: 0, maskAdjustments: [],
     }]);
     setNotice("أضيفت الصورة من الرابط إلى الطابور.");
@@ -132,14 +133,15 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const processOne = useCallback(async (image: CleanerImage) => {
     updateImage(image.id, { status: "detecting", progress: 12, error: undefined });
     try {
-      const imageDataUrl = await readImageAsDataUrl(image.sourceUri, image.mimeType, image.fileSize);
       updateImage(image.id, { status: "cleaning", progress: 48 });
-      const result = await cleanMutation.mutateAsync({ imageDataUrl, fileName: image.fileName, quality, width: image.width, height: image.height });
+      const result = image.sourceKey
+        ? await importedCleanMutation.mutateAsync({ sourceKey: image.sourceKey, fileName: image.fileName, mimeType: image.mimeType as "image/png" | "image/jpeg" | "image/webp", quality, width: image.width, height: image.height })
+        : await cleanMutation.mutateAsync({ imageDataUrl: await readImageAsDataUrl(image.sourceUri, image.mimeType, image.fileSize), fileName: image.fileName, quality, width: image.width, height: image.height });
       updateImage(image.id, { status: "completed", progress: 100, resultUri: result.resultUrl });
     } catch (error) {
       updateImage(image.id, { status: "failed", progress: 0, error: error instanceof Error ? error.message : "تعذرت معالجة الصفحة." });
     }
-  }, [cleanMutation, quality, updateImage]);
+  }, [cleanMutation, importedCleanMutation, quality, updateImage]);
 
   const processBatch = useCallback(async () => {
     const queue = images.filter((image) => image.status === "queued" || image.status === "failed");

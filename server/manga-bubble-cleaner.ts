@@ -29,7 +29,7 @@ export async function importImageFromUrl(value: string) {
   if (!meta.width || !meta.height) throw new Error("تعذر قراءة أبعاد الصورة من الرابط.");
   const fileName = decodeURIComponent(url.pathname.split("/").pop() || "linked-manhwa-page.png").replace(/[^a-zA-Z0-9._-]/g, "-");
   const stored = await storagePut(`manga-bubble-cleaner/imports/${Date.now()}-${fileName}`, buffer, mimeType);
-  return { sourceUrl: stored.url, fileName, mimeType, width: meta.width, height: meta.height, fileSize: buffer.length };
+  return { sourceUrl: stored.url, sourceKey: stored.key, fileName, mimeType, width: meta.width, height: meta.height, fileSize: buffer.length };
 }
 
 export function buildCleaningPrompt(quality: CleaningQuality) {
@@ -90,11 +90,24 @@ export async function cleanMangaBubbleImage(input: {
     buffer,
     mimeType,
   );
-  const sourceUrl = await storageGetSignedUrl(source.key);
+  return cleanStoredMangaBubbleImage({ ...input, sourceKey: source.key, mimeType, sourceUrl: source.url });
+}
+
+export async function cleanStoredMangaBubbleImage(input: {
+  sourceKey: string;
+  sourceUrl?: string;
+  fileName: string;
+  quality: CleaningQuality;
+  width: number;
+  height: number;
+  mimeType: string;
+}) {
+  if (!SUPPORTED_IMAGE_TYPES.has(input.mimeType)) throw new Error("يقبل التطبيق صور PNG أو JPG أو WebP فقط.");
+  const sourceUrl = await storageGetSignedUrl(input.sourceKey);
 
   const cleaned = await generateImage({
     prompt: buildCleaningPrompt(input.quality),
-    originalImages: [{ url: sourceUrl, mimeType }],
+    originalImages: [{ url: sourceUrl, mimeType: input.mimeType }],
     model: "MODEL_GPT_IMAGE_2",
     quality: "high",
   });
@@ -122,6 +135,6 @@ export async function cleanMangaBubbleImage(input: {
 
   return {
     resultUrl: finalResult.url,
-    sourceUrl: source.url,
+    sourceUrl: input.sourceUrl ?? `/manus-storage/${input.sourceKey}`,
   };
 }

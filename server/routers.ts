@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { cleanMangaBubbleImage, importImageFromUrl } from "./manga-bubble-cleaner";
+import { cleanMangaBubbleImage, cleanStoredMangaBubbleImage, importImageFromUrl } from "./manga-bubble-cleaner";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -27,6 +27,13 @@ export const appRouter = router({
     importFromUrl: publicProcedure.input(z.object({ url: z.string().url().max(2048) })).mutation(async ({ input, ctx }) => {
       const imported = await importImageFromUrl(input.url);
       return { ...imported, sourceUrl: absoluteAssetUrl(ctx.req, imported.sourceUrl) };
+    }),
+    cleanImportedMangaBubbles: publicProcedure.input(z.object({
+      sourceKey: z.string().min(1).max(512), fileName: z.string().min(1).max(255), mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+      quality: z.enum(["balanced", "preserve-detail", "maximum-detail"]), width: z.number().int().min(1).max(12000), height: z.number().int().min(1).max(30000),
+    })).mutation(async ({ input, ctx }) => {
+      const result = await cleanStoredMangaBubbleImage(input);
+      return { resultUrl: absoluteAssetUrl(ctx.req, result.resultUrl), originalUrl: absoluteAssetUrl(ctx.req, result.sourceUrl) };
     }),
     cleanMangaBubbles: publicProcedure.input(z.object({
       imageDataUrl: z.string().min(32).max(29_000_000), fileName: z.string().min(1).max(255),
