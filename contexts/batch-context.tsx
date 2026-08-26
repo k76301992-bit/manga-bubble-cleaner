@@ -46,10 +46,10 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const [history, setHistory] = useState<BatchHistory[]>([]);
   const [quality, setQualityState] = useState<QualityPreset>("preserve-detail");
   const [notice, setNotice] = useState("أنشئ دفعة جديدة لإضافة صفحات المانهوا.");
-  const cleanMutation = trpc.image.cleanMangaBubbles.useMutation();
-  const importedCleanMutation = trpc.image.cleanImportedMangaBubbles.useMutation();
+  const storeSourceMutation = trpc.image.storeSource.useMutation();
+  const cleanTileMutation = trpc.image.cleanMangaTile.useMutation();
   const urlMutation = trpc.image.importFromUrl.useMutation();
-  const isProcessing = cleanMutation.isPending || importedCleanMutation.isPending;
+  const isProcessing = storeSourceMutation.isPending || cleanTileMutation.isPending;
   const completedCount = images.filter((image) => image.status === "completed").length;
 
   useEffect(() => {
@@ -133,15 +133,26 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const processOne = useCallback(async (image: CleanerImage) => {
     updateImage(image.id, { status: "detecting", progress: 12, error: undefined });
     try {
-      updateImage(image.id, { status: "cleaning", progress: 48 });
-      const result = image.sourceKey
-        ? await importedCleanMutation.mutateAsync({ sourceKey: image.sourceKey, fileName: image.fileName, mimeType: image.mimeType as "image/png" | "image/jpeg" | "image/webp", quality, width: image.width, height: image.height })
-        : await cleanMutation.mutateAsync({ imageDataUrl: await readImageAsDataUrl(image.sourceUri, image.mimeType, image.fileSize), fileName: image.fileName, quality, width: image.width, height: image.height });
-      updateImage(image.id, { status: "completed", progress: 100, resultUri: result.resultUrl });
+      let sourceKey = image.sourceKey;
+      if (!sourceKey) {
+        const stored = await storeSourceMutation.mutateAsync({ imageDataUrl: await readImageAsDataUrl(image.sourceUri, image.mimeType, image.fileSize), fileName: image.fileName });
+        sourceKey = stored.sourceKey;
+        updateImage(image.id, { sourceKey });
+      }
+      const tileCount = Math.ceil(image.height / 1400);
+      let currentKey = sourceKey;
+      let resultUri = image.sourceUri;
+      for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
+        updateImage(image.id, { status: "cleaning", progress: Math.round(18 + (tileIndex / tileCount) * 76) });
+        const result = await cleanTileMutation.mutateAsync({ sourceKey: currentKey, fileName: image.fileName, quality, width: image.width, height: image.height, tileIndex });
+        currentKey = result.resultKey;
+        resultUri = result.resultUrl;
+      }
+      updateImage(image.id, { status: "completed", progress: 100, resultUri });
     } catch (error) {
       updateImage(image.id, { status: "failed", progress: 0, error: error instanceof Error ? error.message : "تعذرت معالجة الصفحة." });
     }
-  }, [cleanMutation, importedCleanMutation, quality, updateImage]);
+  }, [cleanTileMutation, quality, storeSourceMutation, updateImage]);
 
   const processBatch = useCallback(async () => {
     const queue = images.filter((image) => image.status === "queued" || image.status === "failed");

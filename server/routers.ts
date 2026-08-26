@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { cleanMangaBubbleImage, cleanStoredMangaBubbleImage, importImageFromUrl } from "./manga-bubble-cleaner";
+import { cleanMangaBubbleImage, cleanMangaTile, cleanStoredMangaBubbleImage, importImageFromUrl, storeMangaSource } from "./manga-bubble-cleaner";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -28,6 +28,17 @@ export const appRouter = router({
       const imported = await importImageFromUrl(input.url);
       return { ...imported, sourceUrl: absoluteAssetUrl(ctx.req, imported.sourceUrl) };
     }),
+    storeSource: publicProcedure.input(z.object({ imageDataUrl: z.string().min(32).max(29_000_000), fileName: z.string().min(1).max(255) })).mutation(async ({ input, ctx }) => {
+      const source = await storeMangaSource(input.imageDataUrl, input.fileName);
+      return { ...source, sourceUrl: absoluteAssetUrl(ctx.req, source.sourceUrl) };
+    }),
+    cleanMangaTile: publicProcedure.input(z.object({
+      sourceKey: z.string().min(1).max(512), fileName: z.string().min(1).max(255), quality: z.enum(["balanced", "preserve-detail", "maximum-detail"]),
+      width: z.number().int().min(1).max(12000), height: z.number().int().min(1).max(30000), tileIndex: z.number().int().min(0).max(100),
+    })).mutation(async ({ input, ctx }) => {
+      const result = await cleanMangaTile(input);
+      return { ...result, resultUrl: absoluteAssetUrl(ctx.req, result.resultUrl) };
+    }),
     cleanImportedMangaBubbles: publicProcedure.input(z.object({
       sourceKey: z.string().min(1).max(512), fileName: z.string().min(1).max(255), mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
       quality: z.enum(["balanced", "preserve-detail", "maximum-detail"]), width: z.number().int().min(1).max(12000), height: z.number().int().min(1).max(30000),
@@ -36,8 +47,8 @@ export const appRouter = router({
       return { resultUrl: absoluteAssetUrl(ctx.req, result.resultUrl), originalUrl: absoluteAssetUrl(ctx.req, result.sourceUrl) };
     }),
     cleanMangaBubbles: publicProcedure.input(z.object({
-      imageDataUrl: z.string().min(32).max(29_000_000), fileName: z.string().min(1).max(255),
-      quality: z.enum(["balanced", "preserve-detail", "maximum-detail"]), width: z.number().int().min(1).max(12000), height: z.number().int().min(1).max(30000),
+      imageDataUrl: z.string().min(32).max(29_000_000), fileName: z.string().min(1).max(255), quality: z.enum(["balanced", "preserve-detail", "maximum-detail"]),
+      width: z.number().int().min(1).max(12000), height: z.number().int().min(1).max(30000),
     })).mutation(async ({ input, ctx }) => {
       const result = await cleanMangaBubbleImage(input);
       return { resultUrl: absoluteAssetUrl(ctx.req, result.resultUrl), originalUrl: absoluteAssetUrl(ctx.req, result.sourceUrl) };

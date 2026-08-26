@@ -8,8 +8,8 @@ describe("manga bubble cleanup safeguards", () => {
     const prompt = buildCleaningPrompt("maximum-detail");
 
     expect(prompt).toContain("Remove only visible dialogue lettering");
-    expect(prompt).toContain("Preserve every original non-text stroke");
-    expect(prompt).toContain("Do not redraw, restyle, recolor");
+    expect(prompt).toContain("Preserve all non-text artwork");
+    expect(prompt).toContain("Do not whiten colored bubbles");
   });
 
   it("accepts a supported image data URL", () => {

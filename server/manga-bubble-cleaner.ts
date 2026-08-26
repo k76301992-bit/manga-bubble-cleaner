@@ -1,8 +1,10 @@
 import { generateImage } from "./_core/imageGeneration";
+import { invokeLLM } from "./_core/llm";
 import { storageGetSignedUrl, storagePut } from "./storage";
 import sharp from "sharp";
 
 export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
+type BubbleTextRegion = { x: number; y: number; width: number; height: number };
 
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
@@ -33,108 +35,151 @@ export async function importImageFromUrl(value: string) {
 }
 
 export function buildCleaningPrompt(quality: CleaningQuality) {
-  const qualityInstruction = {
-    balanced:
-      "Use conservative text removal with clean white bubble interiors. Preserve normal line weight and halftone texture.",
-    "preserve-detail":
-      "Prioritize exact preservation of bubble outlines, panel borders, thin ink lines, screentone, and subtle shading. If a region is ambiguous, preserve it rather than altering it.",
-    "maximum-detail":
-      "Use the most conservative high-detail restoration. Preserve every original non-text stroke, hatch, screentone dot pattern, highlight, background detail, and character feature. Do not simplify artwork.",
-  }[quality];
+  const detail = quality === "maximum-detail" ? "Preserve every colored gradient, screentone, and ink stroke." : "Preserve normal line weight, colors, and texture.";
+  return `Remove only visible dialogue lettering inside speech bubbles. Preserve all non-text artwork, bubble outlines, colors, local backgrounds, dimensions, and composition. ${detail} Do not whiten colored bubbles or redraw the page.`;
+}
 
-  return `Edit the provided manga/manhwa page as a precision production cleanup task.
-
-Remove only visible dialogue lettering, narration lettering, sound-effect lettering, punctuation glyphs, and text shadows that are inside speech balloons or caption boxes. Reconstruct the removed areas so each affected balloon interior is clean and naturally white or matches its exact original local background.
-
-Strict preservation rules: preserve the exact canvas dimensions, aspect ratio, panel composition, crop, all characters, faces, clothing, hands, scenery, speech bubble outlines, tails, panel borders, ink contours, screentones, gradients, shadows, highlights, textures, line thickness, and every non-text object. Do not redraw, restyle, recolor, sharpen, blur, crop, expand, translate, add any new text, or change any region outside the text pixels and their immediate erased shadow. Do not remove decorative art that resembles text unless it is clearly lettering.
-
-${qualityInstruction}
-
-Output only the cleaned page with no labels, no watermark, and no added margin.`;
+function buildPatchPrompt(quality: CleaningQuality) {
+  const detail = quality === "maximum-detail" ? "Preserve every colored gradient, screentone, reflected light, texture, and ink stroke." : "Preserve all local colors, shading, texture, and bubble style.";
+  return `This is a small crop from a manga/manhwa page. Remove only dialogue or narration lettering inside a speech bubble or caption area. Reconstruct the exact local backdrop where the lettering was, including colored bubble fills, gradients, patterns, shading, highlights, or white paper as appropriate. ${detail} Do not alter crop edges, characters, faces, bubble outlines, panel borders, or any non-text area. Do not turn a colored bubble white. Return only the repaired crop with no added text or watermark.`;
 }
 
 export function decodeImageDataUrl(dataUrl: string) {
   const match = /^data:([^;]+);base64,([a-zA-Z0-9+/=\s]+)$/.exec(dataUrl);
-  if (!match) {
-    throw new Error("صيغة ملف الصورة غير صالحة.");
-  }
-
+  if (!match) throw new Error("صيغة ملف الصورة غير صالحة.");
   const mimeType = match[1].toLowerCase();
-  if (!SUPPORTED_IMAGE_TYPES.has(mimeType)) {
-    throw new Error("يقبل التطبيق صور PNG أو JPG أو WebP فقط.");
-  }
-
+  if (!SUPPORTED_IMAGE_TYPES.has(mimeType)) throw new Error("يقبل التطبيق صور PNG أو JPG أو WebP فقط.");
   const buffer = Buffer.from(match[2], "base64");
-  if (buffer.length === 0 || buffer.length > MAX_INPUT_BYTES) {
-    throw new Error("يجب ألا يتجاوز حجم الصورة 20 ميغابايت.");
-  }
-
+  if (!buffer.length || buffer.length > MAX_INPUT_BYTES) throw new Error("يجب ألا يتجاوز حجم الصورة 20 ميغابايت.");
   return { mimeType, buffer };
 }
 
 function cleanFileName(fileName: string) {
-  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-");
-  return safeName.slice(0, 96) || "manga-page.png";
+  return fileName.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").slice(0, 96) || "manga-page.png";
 }
 
-export async function cleanMangaBubbleImage(input: {
-  imageDataUrl: string;
-  fileName: string;
-  quality: CleaningQuality;
-  width: number;
-  height: number;
-}) {
-  const { mimeType, buffer } = decodeImageDataUrl(input.imageDataUrl);
-  const source = await storagePut(
-    `manga-bubble-cleaner/originals/${Date.now()}-${cleanFileName(input.fileName)}`,
-    buffer,
-    mimeType,
-  );
-  return cleanStoredMangaBubbleImage({ ...input, sourceKey: source.key, mimeType, sourceUrl: source.url });
-}
-
-export async function cleanStoredMangaBubbleImage(input: {
-  sourceKey: string;
-  sourceUrl?: string;
-  fileName: string;
-  quality: CleaningQuality;
-  width: number;
-  height: number;
-  mimeType: string;
-}) {
-  if (!SUPPORTED_IMAGE_TYPES.has(input.mimeType)) throw new Error("يقبل التطبيق صور PNG أو JPG أو WebP فقط.");
-  const sourceUrl = await storageGetSignedUrl(input.sourceKey);
-
-  const cleaned = await generateImage({
-    prompt: buildCleaningPrompt(input.quality),
-    originalImages: [{ url: sourceUrl, mimeType: input.mimeType }],
-    model: "MODEL_GPT_IMAGE_2",
-    quality: "high",
+async function detectBubbleTextRegions(tileUrl: string, width: number, height: number): Promise<BubbleTextRegion[]> {
+  const result = await invokeLLM({
+    model: "gemini-3.1-pro-preview",
+    maxTokens: 2200,
+    messages: [{ role: "user", content: [
+      { type: "text", text: `Find every readable dialogue or narration text group inside speech bubbles or caption boxes in this manga crop, including bubbles with white, yellow, red, black, translucent, or patterned fills. Ignore decorative sound effects, logos, panel borders, and text outside bubbles. Return JSON only: an array of objects in the form {"box_2d":[ymin,xmin,ymax,xmax],"label":"dialogue"}, where each coordinate is normalized from 0 to 1000. Use a box whenever dialogue text is visible; do not omit colored bubbles.` },
+      { type: "image_url", image_url: { url: tileUrl, detail: "high" } },
+    ] }], responseFormat: { type: "json_object" },
   });
+  const content = result.choices[0]?.message.content;
+  const raw = typeof content === "string"
+    ? content
+    : (content ?? []).filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n");
+  try {
+    const parsed = JSON.parse(raw || "[]") as Array<{ box_2d?: number[] }> | { boxes?: BubbleTextRegion[] };
+    if (Array.isArray(parsed)) {
+      return parsed.flatMap((item) => {
+        const box = item.box_2d;
+        if (!box || box.length !== 4) return [];
+        const [ymin, xmin, ymax, xmax] = box;
+        if (![ymin, xmin, ymax, xmax].every(Number.isFinite) || ymax <= ymin || xmax <= xmin) return [];
+        return [{ x: Math.round((xmin / 1000) * width), y: Math.round((ymin / 1000) * height), width: Math.round(((xmax - xmin) / 1000) * width), height: Math.round(((ymax - ymin) / 1000) * height) }];
+      });
+    }
+    return (parsed.boxes ?? []).filter((box) => Number.isFinite(box.x) && Number.isFinite(box.y) && box.width > 4 && box.height > 4 && box.x >= 0 && box.y >= 0);
+  } catch { return []; }
+}
 
-  if (!cleaned.url) {
-    throw new Error("لم تُنتج المعالجة صورة قابلة للعرض. حاول مرة أخرى.");
+function uniqueRegions(regions: BubbleTextRegion[]) {
+  return regions.filter((region, index, all) => !all.slice(0, index).some((other) => {
+    const ox = Math.max(0, Math.min(region.x + region.width, other.x + other.width) - Math.max(region.x, other.x));
+    const oy = Math.max(0, Math.min(region.y + region.height, other.y + other.height) - Math.max(region.y, other.y));
+    return (ox * oy) / Math.min(region.width * region.height, other.width * other.height) > 0.7;
+  })).slice(0, 6);
+}
+
+function patchGeometry(region: BubbleTextRegion, width: number, height: number) {
+  const padding = 32;
+  const side = Math.min(Math.max(region.width, region.height) + padding * 2, width, height, 1024);
+  const x = Math.max(0, Math.min(width - side, Math.round(region.x + region.width / 2 - side / 2)));
+  const y = Math.max(0, Math.min(height - side, Math.round(region.y + region.height / 2 - side / 2)));
+  return { left: x, top: y, width: Math.round(side), height: Math.round(side) };
+}
+
+export async function cleanMangaBubbleImage(input: { imageDataUrl: string; fileName: string; quality: CleaningQuality; width: number; height: number }) {
+  const source = await storeMangaSource(input.imageDataUrl, input.fileName);
+  return cleanStoredMangaBubbleImage({ ...input, ...source });
+}
+
+export async function storeMangaSource(imageDataUrl: string, fileName: string) {
+  const { mimeType, buffer } = decodeImageDataUrl(imageDataUrl);
+  const source = await storagePut(`manga-bubble-cleaner/originals/${Date.now()}-${cleanFileName(fileName)}`, buffer, mimeType);
+  return { sourceKey: source.key, sourceUrl: source.url, mimeType };
+}
+
+export async function cleanMangaTile(input: { sourceKey: string; fileName: string; quality: CleaningQuality; width: number; height: number; tileIndex: number }) {
+  const signedSource = await storageGetSignedUrl(input.sourceKey);
+  const sourceResponse = await fetch(signedSource);
+  if (!sourceResponse.ok) throw new Error("تعذر تنزيل الصفحة للمقطع الحالي.");
+  const sourceBuffer = Buffer.from(await sourceResponse.arrayBuffer());
+  const meta = await sharp(sourceBuffer).metadata();
+  const width = meta.width ?? input.width;
+  const height = meta.height ?? input.height;
+  const tileHeight = 1400;
+  const top = input.tileIndex * tileHeight;
+  if (top >= height) throw new Error("رقم المقطع خارج حدود الصفحة.");
+  const currentHeight = Math.min(tileHeight, height - top);
+  const tileBuffer = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).png().toBuffer();
+  const storedTile = await storagePut(`manga-bubble-cleaner/tiles/${Date.now()}-${input.tileIndex}.png`, tileBuffer, "image/png");
+  const regions = uniqueRegions((await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight)).map((region) => ({ ...region, y: region.y + top })));
+  const overlays: Array<{ input: Buffer; left: number; top: number }> = [];
+  for (const region of regions) {
+    const patch = patchGeometry(region, width, height);
+    const patchBuffer = await sharp(sourceBuffer).extract(patch).png().toBuffer();
+    const storedPatch = await storagePut(`manga-bubble-cleaner/patches/${Date.now()}-${patch.left}-${patch.top}.png`, patchBuffer, "image/png");
+    const repaired = await generateImage({ prompt: buildPatchPrompt(input.quality), originalImages: [{ url: await storageGetSignedUrl(storedPatch.key), mimeType: "image/png" }], model: "MODEL_GPT_IMAGE_2", quality: "high" });
+    if (!repaired.url) continue;
+    const response = await fetch(await storageGetSignedUrl(repaired.url.replace(/^\/manus-storage\//, "")));
+    if (!response.ok) continue;
+    const repairedPatch = await sharp(Buffer.from(await response.arrayBuffer())).resize({ width: patch.width, height: patch.height, fit: "fill", kernel: sharp.kernel.lanczos3 }).png().toBuffer();
+    overlays.push({ input: repairedPatch, left: patch.left, top: patch.top });
+  }
+  const finalBuffer = await sharp(sourceBuffer).composite(overlays).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+  const result = await storagePut(`manga-bubble-cleaner/tile-results/${Date.now()}-${input.tileIndex}-${cleanFileName(input.fileName).replace(/\.[^.]+$/, "")}.png`, finalBuffer, "image/png");
+  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / tileHeight), detectedRegions: regions.length, processedRegions: overlays.length };
+}
+
+export async function cleanStoredMangaBubbleImage(input: { sourceKey: string; sourceUrl?: string; fileName: string; quality: CleaningQuality; width: number; height: number; mimeType: string }) {
+  if (!SUPPORTED_IMAGE_TYPES.has(input.mimeType)) throw new Error("يقبل التطبيق صور PNG أو JPG أو WebP فقط.");
+  const signedSource = await storageGetSignedUrl(input.sourceKey);
+  const sourceResponse = await fetch(signedSource);
+  if (!sourceResponse.ok) throw new Error("تعذر تنزيل الصورة الأصلية للمعالجة.");
+  const sourceBuffer = Buffer.from(await sourceResponse.arrayBuffer());
+  const meta = await sharp(sourceBuffer).metadata();
+  const width = meta.width ?? input.width;
+  const height = meta.height ?? input.height;
+  const regions: BubbleTextRegion[] = [];
+  const tileHeight = 3000;
+
+  for (let top = 0; top < height; top += tileHeight) {
+    const currentHeight = Math.min(tileHeight, height - top);
+    const tileBuffer = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).png().toBuffer();
+    const storedTile = await storagePut(`manga-bubble-cleaner/tiles/${Date.now()}-${top}.png`, tileBuffer, "image/png");
+    const boxes = await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight);
+    regions.push(...boxes.map((box) => ({ ...box, y: box.y + top })));
   }
 
-  const generatedKey = cleaned.url.replace(/^\/manus-storage\//, "");
-  const generatedUrl = await storageGetSignedUrl(generatedKey);
-  const generatedResponse = await fetch(generatedUrl);
-  if (!generatedResponse.ok) {
-    throw new Error("تعذر تنزيل نتيجة التبييض لتحضيرها للتصدير.");
+  const overlays: Array<{ input: Buffer; left: number; top: number }> = [];
+  for (const region of uniqueRegions(regions)) {
+    const patch = patchGeometry(region, width, height);
+    const patchBuffer = await sharp(sourceBuffer).extract(patch).png().toBuffer();
+    const storedPatch = await storagePut(`manga-bubble-cleaner/patches/${Date.now()}-${patch.left}-${patch.top}.png`, patchBuffer, "image/png");
+    const repaired = await generateImage({ prompt: buildPatchPrompt(input.quality), originalImages: [{ url: await storageGetSignedUrl(storedPatch.key), mimeType: "image/png" }], model: "MODEL_GPT_IMAGE_2", quality: "high" });
+    if (!repaired.url) continue;
+    const key = repaired.url.replace(/^\/manus-storage\//, "");
+    const response = await fetch(await storageGetSignedUrl(key));
+    if (!response.ok) continue;
+    const repairedPatch = await sharp(Buffer.from(await response.arrayBuffer())).resize({ width: patch.width, height: patch.height, fit: "fill", kernel: sharp.kernel.lanczos3 }).png().toBuffer();
+    overlays.push({ input: repairedPatch, left: patch.left, top: patch.top });
   }
-  const generatedBuffer = Buffer.from(await generatedResponse.arrayBuffer());
-  const resizedBuffer = await sharp(generatedBuffer)
-    .resize({ width: input.width, height: input.height, fit: "fill", kernel: sharp.kernel.lanczos3 })
-    .png({ compressionLevel: 9, adaptiveFiltering: true })
-    .toBuffer();
-  const finalResult = await storagePut(
-    `manga-bubble-cleaner/results/${Date.now()}-${cleanFileName(input.fileName).replace(/\.[^.]+$/, "")}.png`,
-    resizedBuffer,
-    "image/png",
-  );
 
-  return {
-    resultUrl: finalResult.url,
-    sourceUrl: input.sourceUrl ?? `/manus-storage/${input.sourceKey}`,
-  };
+  const finalBuffer = await sharp(sourceBuffer).composite(overlays).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+  const finalResult = await storagePut(`manga-bubble-cleaner/results/${Date.now()}-${cleanFileName(input.fileName).replace(/\.[^.]+$/, "")}.png`, finalBuffer, "image/png");
+  return { resultUrl: finalResult.url, sourceUrl: input.sourceUrl ?? `/manus-storage/${input.sourceKey}`, processedRegions: overlays.length };
 }
