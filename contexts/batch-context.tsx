@@ -7,10 +7,12 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 import { readImageAsDataUrl } from "@/lib/image-upload";
 import { trpc } from "@/lib/trpc";
-import { QUALITY_PRESETS, type CleanerImage, type QualityPreset } from "@/shared/bubble-cleaner-types";
+import { QUALITY_PRESETS, type CleanerImage, type QualityPreset, type StudioProject } from "@/shared/bubble-cleaner-types";
 
 type BatchContextValue = {
   images: CleanerImage[];
+  project: StudioProject;
+  projects: StudioProject[];
   history: BatchHistory[];
   quality: QualityPreset;
   notice: string;
@@ -24,6 +26,8 @@ type BatchContextValue = {
   processBatch: () => Promise<void>;
   retryImage: (id: string) => Promise<void>;
   setQuality: (quality: QualityPreset) => void;
+  renameProject: (name: string) => void;
+  startNewProject: (name?: string) => void;
 };
 
 export type BatchHistory = { id: string; total: number; completed: number; updatedAt: string };
@@ -31,8 +35,15 @@ export type BatchHistory = { id: string; total: number; completed: number; updat
 const BatchContext = createContext<BatchContextValue | null>(null);
 const SETTINGS_KEY = "bubbleclean-v2-quality";
 const HISTORY_KEY = "bubbleclean-v2-history";
+const ACTIVE_PROJECT_KEY = "bubbleclean-v3-active-project";
+const PROJECT_LIBRARY_KEY = "bubbleclean-v3-project-library";
 
 const createId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+function newProject(name = "مشروع مانهوا جديد"): StudioProject {
+  const now = new Date().toISOString();
+  return { id: createId(), name, createdAt: now, updatedAt: now, images: [], qualityPreset: "preserve-detail", stage: "import" };
+}
 
 function imageSize(uri: string) {
   return new Promise<{ width: number; height: number }>((resolve) => {
@@ -42,6 +53,9 @@ function imageSize(uri: string) {
 
 export function BatchProvider({ children }: { children: React.ReactNode }) {
   const [images, setImages] = useState<CleanerImage[]>([]);
+  const [project, setProject] = useState<StudioProject>(() => newProject());
+  const [projects, setProjects] = useState<StudioProject[]>([]);
+  const [projectReady, setProjectReady] = useState(false);
   const [batchId, setBatchId] = useState(createId);
   const [history, setHistory] = useState<BatchHistory[]>([]);
   const [quality, setQualityState] = useState<QualityPreset>("preserve-detail");
@@ -66,6 +80,27 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
+    AsyncStorage.getItem(ACTIVE_PROJECT_KEY).then((raw) => {
+      if (!raw) return;
+      try {
+        const saved = JSON.parse(raw) as StudioProject;
+        if (saved?.id && saved?.name && Array.isArray(saved.images)) {
+          setProject(saved); setImages(saved.images);
+          if (saved.qualityPreset) setQualityState(saved.qualityPreset);
+          setNotice(`استُعيد مشروع «${saved.name}» مع ${saved.images.length.toLocaleString("ar")} صفحة.`);
+        }
+      } catch { /* ignore invalid local project */ }
+    }).finally(() => setProjectReady(true));
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(PROJECT_LIBRARY_KEY).then((raw) => {
+      if (!raw) return;
+      try { const saved = JSON.parse(raw); if (Array.isArray(saved)) setProjects(saved); } catch { /* ignore invalid library */ }
+    });
+  }, []);
+
+  useEffect(() => {
     if (history.length) void AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(history));
   }, [history]);
 
@@ -74,6 +109,19 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
     const entry: BatchHistory = { id: batchId, total: images.length, completed: images.filter((image) => image.status === "completed").length, updatedAt: new Date().toISOString() };
     setHistory((current) => [entry, ...current.filter((item) => item.id !== batchId)].slice(0, 4));
   }, [batchId, images]);
+
+  useEffect(() => {
+    if (!projectReady) return;
+    const completed = images.filter((image) => image.status === "completed").length;
+    const stage: StudioProject["stage"] = completed === images.length && images.length > 0 ? "ready" : completed > 0 ? "review" : isProcessing ? "cleaning" : "import";
+    const snapshot: StudioProject = { ...project, images, qualityPreset: quality, stage, updatedAt: new Date().toISOString() };
+    void AsyncStorage.setItem(ACTIVE_PROJECT_KEY, JSON.stringify(snapshot));
+    setProjects((current) => [snapshot, ...current.filter((item) => item.id !== snapshot.id)].slice(0, 20));
+  }, [images, isProcessing, project, projectReady, quality]);
+
+  useEffect(() => {
+    if (projectReady) void AsyncStorage.setItem(PROJECT_LIBRARY_KEY, JSON.stringify(projects));
+  }, [projectReady, projects]);
 
   const setQuality = useCallback((next: QualityPreset) => {
     setQualityState(next);
@@ -139,7 +187,7 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
         sourceKey = stored.sourceKey;
         updateImage(image.id, { sourceKey });
       }
-      const tileCount = Math.ceil(image.height / 1400);
+      const tileCount = Math.ceil(image.height / 2400);
       let currentKey = sourceKey;
       let resultUri = image.sourceUri;
       for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
@@ -163,11 +211,13 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   }, [images, processOne]);
 
   const value = useMemo<BatchContextValue>(() => ({
-    images, history, quality, notice, isProcessing, completedCount,
+    images, project, projects, history, quality, notice, isProcessing, completedCount,
     chooseFiles, chooseGallery, importFromUrl, removeImage: (id) => setImages((current) => current.filter((image) => image.id !== id)),
     clearBatch: () => { setImages([]); setBatchId(createId()); setNotice("أُفرغت الدفعة الحالية؛ لم يُحذف أي ملف من جهازك."); },
     processBatch, retryImage: async (id) => { const image = images.find((item) => item.id === id); if (image) await processOne(image); }, setQuality,
-  }), [chooseFiles, chooseGallery, completedCount, history, images, importFromUrl, isProcessing, notice, processBatch, processOne, quality, setQuality]);
+    renameProject: (name) => { const normalized = name.trim(); if (normalized) setProject((current) => ({ ...current, name: normalized })); },
+    startNewProject: (name) => { setImages([]); setBatchId(createId()); setProject(newProject(name)); setNotice("بدأ مشروع جديد. أضف صفحاته من الملفات أو الرابط."); },
+  }), [chooseFiles, chooseGallery, completedCount, history, images, importFromUrl, isProcessing, notice, processBatch, processOne, project, projects, quality, setQuality]);
 
   return <BatchContext.Provider value={value}>{children}</BatchContext.Provider>;
 }

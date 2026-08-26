@@ -8,6 +8,7 @@ type BubbleTextRegion = { x: number; y: number; width: number; height: number };
 
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const TILE_HEIGHT = 2400;
 
 export function ensurePublicImageUrl(value: string) {
   let url: URL;
@@ -94,6 +95,29 @@ function uniqueRegions(regions: BubbleTextRegion[]) {
   })).slice(0, 6);
 }
 
+type Pixel = [number, number, number, number];
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const mix = (a: Pixel, b: Pixel, amount: number): Pixel => [a[0] + (b[0] - a[0]) * amount, a[1] + (b[1] - a[1]) * amount, a[2] + (b[2] - a[2]) * amount, 255];
+
+/** Rebuilds only high-contrast letter pixels from the bubble's own surrounding colors. */
+export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
+  const output = Buffer.from(source);
+  const read = (x: number, y: number): Pixel => { const offset = (y * width + x) * 4; return [source[offset], source[offset + 1], source[offset + 2], source[offset + 3]]; };
+  const write = (x: number, y: number, color: Pixel) => { const offset = (y * width + x) * 4; output[offset] = Math.round(color[0]); output[offset + 1] = Math.round(color[1]); output[offset + 2] = Math.round(color[2]); output[offset + 3] = source[offset + 3]; };
+  for (const region of uniqueRegions(regions)) {
+    const x0 = clamp(region.x - 2, 3, width - 4); const y0 = clamp(region.y - 2, 3, height - 4);
+    const x1 = clamp(region.x + region.width + 2, x0 + 1, width - 4); const y1 = clamp(region.y + region.height + 2, y0 + 1, height - 4);
+    for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
+      const horizontal = mix(read(x0 - 3, y), read(x1 + 3, y), (x - x0) / Math.max(1, x1 - x0));
+      const vertical = mix(read(x, y0 - 3), read(x, y1 + 3), (y - y0) / Math.max(1, y1 - y0));
+      const target: Pixel = [(horizontal[0] + vertical[0]) / 2, (horizontal[1] + vertical[1]) / 2, (horizontal[2] + vertical[2]) / 2, 255];
+      const current = read(x, y); const contrast = Math.hypot(current[0] - target[0], current[1] - target[1], current[2] - target[2]);
+      if (contrast > 34) write(x, y, mix(current, target, contrast > 112 ? 1 : 0.9));
+    }
+  }
+  return output;
+}
+
 function patchGeometry(region: BubbleTextRegion, width: number, height: number) {
   const padding = 32;
   const side = Math.min(Math.max(region.width, region.height) + padding * 2, width, height, 1024);
@@ -121,28 +145,18 @@ export async function cleanMangaTile(input: { sourceKey: string; fileName: strin
   const meta = await sharp(sourceBuffer).metadata();
   const width = meta.width ?? input.width;
   const height = meta.height ?? input.height;
-  const tileHeight = 1400;
-  const top = input.tileIndex * tileHeight;
+  const top = input.tileIndex * TILE_HEIGHT;
   if (top >= height) throw new Error("رقم المقطع خارج حدود الصفحة.");
-  const currentHeight = Math.min(tileHeight, height - top);
-  const tileBuffer = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).png().toBuffer();
+  const currentHeight = Math.min(TILE_HEIGHT, height - top);
+  const tile = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const tileBuffer = await sharp(tile.data, { raw: { width, height: currentHeight, channels: 4 } }).png().toBuffer();
   const storedTile = await storagePut(`manga-bubble-cleaner/tiles/${Date.now()}-${input.tileIndex}.png`, tileBuffer, "image/png");
-  const regions = uniqueRegions((await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight)).map((region) => ({ ...region, y: region.y + top })));
-  const overlays: Array<{ input: Buffer; left: number; top: number }> = [];
-  for (const region of regions) {
-    const patch = patchGeometry(region, width, height);
-    const patchBuffer = await sharp(sourceBuffer).extract(patch).png().toBuffer();
-    const storedPatch = await storagePut(`manga-bubble-cleaner/patches/${Date.now()}-${patch.left}-${patch.top}.png`, patchBuffer, "image/png");
-    const repaired = await generateImage({ prompt: buildPatchPrompt(input.quality), originalImages: [{ url: await storageGetSignedUrl(storedPatch.key), mimeType: "image/png" }], model: "MODEL_GPT_IMAGE_2", quality: "high" });
-    if (!repaired.url) continue;
-    const response = await fetch(await storageGetSignedUrl(repaired.url.replace(/^\/manus-storage\//, "")));
-    if (!response.ok) continue;
-    const repairedPatch = await sharp(Buffer.from(await response.arrayBuffer())).resize({ width: patch.width, height: patch.height, fit: "fill", kernel: sharp.kernel.lanczos3 }).png().toBuffer();
-    overlays.push({ input: repairedPatch, left: patch.left, top: patch.top });
-  }
-  const finalBuffer = await sharp(sourceBuffer).composite(overlays).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+  const regions = uniqueRegions(await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight));
+  const repairedRaw = inpaintDetectedTextBoxes(tile.data, width, currentHeight, regions);
+  const repairedTile = await sharp(repairedRaw, { raw: { width, height: currentHeight, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
+  const finalBuffer = await sharp(sourceBuffer).composite([{ input: repairedTile, left: 0, top }]).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
   const result = await storagePut(`manga-bubble-cleaner/tile-results/${Date.now()}-${input.tileIndex}-${cleanFileName(input.fileName).replace(/\.[^.]+$/, "")}.png`, finalBuffer, "image/png");
-  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / tileHeight), detectedRegions: regions.length, processedRegions: overlays.length };
+  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / TILE_HEIGHT), detectedRegions: regions.length, processedRegions: regions.length };
 }
 
 export async function cleanStoredMangaBubbleImage(input: { sourceKey: string; sourceUrl?: string; fileName: string; quality: CleaningQuality; width: number; height: number; mimeType: string }) {

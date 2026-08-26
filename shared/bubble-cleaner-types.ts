@@ -44,6 +44,16 @@ export interface CleanerSession {
   keepOriginalDimensions: boolean;
 }
 
+export interface StudioProject {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  images: CleanerImage[];
+  qualityPreset: QualityPreset;
+  stage: "import" | "cleaning" | "review" | "ready";
+}
+
 export interface CleanerSettings {
   defaultQualityPreset: QualityPreset;
   defaultExportFormat: ExportFormat;

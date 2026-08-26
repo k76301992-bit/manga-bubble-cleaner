@@ -5,11 +5,11 @@ import { ScreenContainer } from "@/components/screen-container";
 import { useBatch } from "@/contexts/batch-context";
 
 export default function StudioScreen() {
-  const { images, history, completedCount, chooseFiles, chooseGallery, processBatch, isProcessing } = useBatch();
+  const { images, project, history, completedCount, chooseFiles, chooseGallery, processBatch, isProcessing } = useBatch();
   const waiting = images.filter((item) => item.status === "queued" || item.status === "failed").length;
   return <ScreenContainer className="flex-1" containerClassName="bg-background"><ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
     <View style={s.top}><View><Text style={s.eyebrow}>BUBBLECLEAN / STUDIO</Text><Text style={s.title}>استوديو التبييض</Text></View><View style={s.avatar}><MaterialIcons name="auto-fix-high" size={22} color="#08101B" /></View></View>
-    <View style={s.hero}><View style={s.orb}><MaterialIcons name="format-color-reset" size={48} color="#fff" /></View><Text style={s.heroKicker}>دفعة جديدة</Text><Text style={s.heroTitle}>نظّف الفقاعات،{`\n`}واحفظ الرسم.</Text><Text style={s.heroText}>أضف صفحات مانهوا ثم راقب المعالجة والمراجعة في مسار واضح.</Text>
+    <View style={s.hero}><View style={s.orb}><MaterialIcons name="format-color-reset" size={48} color="#fff" /></View><Text style={s.heroKicker}>المشروع النشط · {project.name}</Text><Text style={s.heroTitle}>نظّف الفقاعات،{`\n`}واحفظ الرسم.</Text><Text style={s.heroText}>تُحفظ صفحات المشروع وحالتها تلقائيًا، لتستكمل عملك أو تسلّمه للمراجع لاحقًا.</Text>
       <Pressable onPress={chooseFiles} style={({pressed})=>[s.primary, pressed&&s.pressed]}><MaterialIcons name="add-photo-alternate" size={22} color="#08101B"/><Text style={s.primaryText}>إضافة صفحات</Text></Pressable>
     </View>
     <View style={s.stats}><Stat icon="collections" label="في الدفعة" value={images.length.toLocaleString("ar")} /><Stat icon="check-circle" label="جاهزة" value={completedCount.toLocaleString("ar")} /><Stat icon="pending" label="بانتظارك" value={waiting.toLocaleString("ar")} /></View>
