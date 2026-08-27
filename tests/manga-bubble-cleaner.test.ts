@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions } from "../server/standalone/cleaner";
+import { cleaningProfileFor, detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions } from "../server/standalone/cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("normalizes incomplete local settings without weakening the quality default", () => {
@@ -43,6 +43,26 @@ describe("manga bubble cleanup safeguards", () => {
     expect(repaired[center + 1]).toBeLessThan(80);
     expect(Math.abs(repaired[clearBackdrop] - source[clearBackdrop])).toBeLessThan(16);
     expect(repaired[untouched]).toBe(source[untouched]);
+  });
+
+  it("cleans compact dark glyphs inside a light bubble without painting over its dark border", () => {
+    const source = Buffer.alloc(120 * 100 * 4, 255);
+    for (let y = 0; y < 100; y += 1) for (let x = 0; x < 120; x += 1) {
+      const offset = (y * 120 + x) * 4;
+      if (x === 18 || x === 101 || y === 18 || y === 81) source[offset] = source[offset + 1] = source[offset + 2] = 0;
+    }
+    for (const glyphX of [49, 58, 67]) for (let y = 43; y < 54; y += 1) for (let x = glyphX; x < glyphX + 3; x += 1) {
+      const offset = (y * 120 + x) * 4; source[offset] = source[offset + 1] = source[offset + 2] = 0;
+    }
+    const repaired = inpaintDetectedTextBoxes(source, 120, 100, [{ x: 45, y: 40, width: 30, height: 18 }]);
+    expect(repaired[(18 * 120 + 60) * 4]).toBeLessThan(25);
+    expect(repaired[(48 * 120 + 59) * 4]).toBeGreaterThan(220);
+  });
+
+  it("uses materially different speed and detail profiles", () => {
+    expect(cleaningProfileFor("balanced").tileHeight).toBeGreaterThan(cleaningProfileFor("maximum-detail").tileHeight);
+    expect(cleaningProfileFor("balanced").useRemoteWhenLocalMisses).toBe(false);
+    expect(cleaningProfileFor("maximum-detail").useRemoteWhenLocalMisses).toBe(true);
   });
 
   it("maps a manual include region to its intersecting tile only", () => {

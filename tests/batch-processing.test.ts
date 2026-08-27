@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { createResultZip, extractImagesFromZip, naturalNameCompare, outputNameForSource } from "../server/standalone/batch-processing";
+import { createResultZip, extractImagesFromZip, MAX_IMAGES_PER_BATCH, naturalNameCompare, outputNameForSource, validateBatchImages } from "../server/standalone/batch-processing";
 import { parseGoogleDriveUrl } from "../server/standalone/google-drive";
 
 describe("batch processing sources", () => {
@@ -16,6 +16,12 @@ describe("batch processing sources", () => {
     zip.file("chapter/readme.txt", "ignored");
     const images = await extractImagesFromZip(Buffer.from(await zip.generateAsync({ type: "nodebuffer" })));
     expect(images.map((image) => image.name)).toEqual(["page-2.png", "page-10.webp"]);
+  });
+
+  it("allows a ten-page chapter while retaining a total-memory limit", () => {
+    const pages = Array.from({ length: 10 }, (_, index) => ({ name: `page-${index + 1}.png`, mimeType: "image/png", image: Buffer.from([index]) }));
+    expect(MAX_IMAGES_PER_BATCH).toBe(10);
+    expect(() => validateBatchImages(pages)).not.toThrow();
   });
 
   it("returns a ZIP result with the cleaned output names", async () => {

@@ -5,9 +5,14 @@ import { MAX_IMAGE_BYTES, processImageInMemory, supportedImageTypes } from "./pr
 
 export type BatchImage = { name: string; mimeType: string; image: Buffer };
 export type CleanedBatchImage = { sourceName: string; outputName: string; image: Buffer };
-export const MAX_IMAGES_PER_BATCH = 5;
+export const MAX_IMAGES_PER_BATCH = 10;
 export const MAX_ZIP_BYTES = 25 * 1024 * 1024;
 const MAX_UNCOMPRESSED_ZIP_BYTES = 100 * 1024 * 1024;
+
+function releaseUnusedPageBuffers() {
+  const collect = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+  if (typeof collect === "function") collect();
+}
 
 export function mimeTypeForFileName(value: string) {
   const extension = extname(value).toLowerCase();
@@ -64,6 +69,7 @@ export async function cleanBatchInMemory(input: { images: BatchImage[]; quality:
     await input.onProgress?.(index, images.length, source.name);
     const result = await processImageInMemory({ image: source.image, mimeType: source.mimeType, fileName: source.name, quality: input.quality });
     results.push({ sourceName: source.name, outputName: outputNameForSource(source.name), image: result.image });
+    releaseUnusedPageBuffers();
     await input.onProgress?.(index + 1, images.length, source.name);
   }
   return results;
