@@ -1,7 +1,4 @@
 /**
- * Unified type exports
- * Import shared types from this single entry point.
+ * Shared type exports for the standalone application.
  */
-
-export type * from "../drizzle/schema";
 export * from "./_core/errors";

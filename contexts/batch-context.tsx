@@ -5,8 +5,7 @@ import * as ImagePicker from "expo-image-picker";
 import { Image, Platform } from "react-native";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
-import { readImageAsDataUrl } from "@/lib/image-upload";
-import { trpc } from "@/lib/trpc";
+import { downloadImageToDevice, processImageOnStandaloneServer } from "@/lib/standalone-processing-api";
 import { QUALITY_PRESETS, type BubbleMaskAdjustment, type CleanerImage, type QualityPreset, type StudioProject } from "@/shared/bubble-cleaner-types";
 
 type BatchContextValue = {
@@ -61,10 +60,7 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const [history, setHistory] = useState<BatchHistory[]>([]);
   const [quality, setQualityState] = useState<QualityPreset>("preserve-detail");
   const [notice, setNotice] = useState("أنشئ دفعة جديدة لإضافة صفحات المانهوا.");
-  const storeSourceMutation = trpc.image.storeSource.useMutation();
-  const cleanTileMutation = trpc.image.cleanMangaTile.useMutation();
-  const urlMutation = trpc.image.importFromUrl.useMutation();
-  const isProcessing = storeSourceMutation.isPending || cleanTileMutation.isPending;
+  const [isProcessing, setIsProcessing] = useState(false);
   const completedCount = images.filter((image) => image.status === "completed").length;
 
   useEffect(() => {
@@ -167,13 +163,14 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const importFromUrl = useCallback(async (url: string) => {
     const normalized = url.trim();
     if (!normalized) throw new Error("أدخل رابطًا مباشرًا لصورة PNG أو JPG أو WebP.");
-    const imported = await urlMutation.mutateAsync({ url: normalized });
+    const imported = await downloadImageToDevice(normalized);
+    const dimensions = await imageSize(imported.uri);
     setImages((current) => [...current, {
-      id: createId(), sourceUri: imported.sourceUrl, sourceKey: imported.sourceKey, fileName: imported.fileName, mimeType: imported.mimeType,
-      width: imported.width, height: imported.height, fileSize: imported.fileSize, status: "queued", progress: 0, maskAdjustments: [],
+      id: createId(), sourceUri: imported.uri, fileName: imported.fileName, mimeType: imported.mimeType,
+      width: dimensions.width, height: dimensions.height, fileSize: imported.fileSize, status: "queued", progress: 0, maskAdjustments: [],
     }]);
     setNotice("أضيفت الصورة من الرابط إلى الطابور.");
-  }, [urlMutation]);
+  }, []);
 
   const updateImage = useCallback((id: string, patch: Partial<CleanerImage>) => {
     setImages((current) => current.map((image) => image.id === id ? { ...image, ...patch } : image));
@@ -182,33 +179,23 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
   const processOne = useCallback(async (image: CleanerImage) => {
     updateImage(image.id, { status: "detecting", progress: 12, error: undefined });
     try {
-      let sourceKey = image.sourceKey;
-      if (!sourceKey) {
-        const stored = await storeSourceMutation.mutateAsync({ imageDataUrl: await readImageAsDataUrl(image.sourceUri, image.mimeType, image.fileSize), fileName: image.fileName });
-        sourceKey = stored.sourceKey;
-        updateImage(image.id, { sourceKey });
-      }
-      const tileCount = Math.ceil(image.height / 1200);
-      let currentKey = sourceKey;
-      let resultUri = image.sourceUri;
-      for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
-        updateImage(image.id, { status: "cleaning", progress: Math.round(18 + (tileIndex / tileCount) * 76) });
-        const result = await cleanTileMutation.mutateAsync({ sourceKey: currentKey, fileName: image.fileName, quality, width: image.width, height: image.height, tileIndex, maskAdjustments: image.maskAdjustments });
-        currentKey = result.resultKey;
-        resultUri = result.resultUrl;
-      }
-      updateImage(image.id, { status: "completed", progress: 100, resultUri });
+      updateImage(image.id, { status: "cleaning", progress: 38 });
+      const result = await processImageOnStandaloneServer({ sourceUri: image.sourceUri, fileName: image.fileName, mimeType: image.mimeType, quality, maskAdjustments: image.maskAdjustments });
+      updateImage(image.id, { status: "completed", progress: 100, resultUri: result.resultUri });
     } catch (error) {
       updateImage(image.id, { status: "failed", progress: 0, error: error instanceof Error ? error.message : "تعذرت معالجة الصفحة." });
     }
-  }, [cleanTileMutation, quality, storeSourceMutation, updateImage]);
+  }, [quality, updateImage]);
 
   const processBatch = useCallback(async () => {
     const queue = images.filter((image) => image.status === "queued" || image.status === "failed");
     if (!queue.length) { setNotice("الطابور فارغ أو اكتملت جميع الصفحات."); return; }
-    setNotice(`تتم معالجة ${queue.length.toLocaleString("ar")} صفحة بالتتالي. يمكنك مراجعة النتائج عند اكتمالها.`);
-    for (const image of queue) await processOne(image);
-    if (Platform.OS !== "web") void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setIsProcessing(true);
+    try {
+      setNotice(`تتم معالجة ${queue.length.toLocaleString("ar")} صفحة بالتتالي. يمكنك مراجعة النتائج عند اكتمالها.`);
+      for (const image of queue) await processOne(image);
+      if (Platform.OS !== "web") void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } finally { setIsProcessing(false); }
   }, [images, processOne]);
 
   const value = useMemo<BatchContextValue>(() => ({
