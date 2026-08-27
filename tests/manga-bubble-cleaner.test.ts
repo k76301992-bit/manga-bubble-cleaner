@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { cleaningProfileFor, detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
+import { cleanImageInMemory, cleaningProfileFor, detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("normalizes incomplete local settings without weakening the quality default", () => {
@@ -65,6 +65,14 @@ describe("manga bubble cleanup safeguards", () => {
     expect(cleaningProfileFor("maximum-detail").useRemoteWhenLocalMisses).toBe(true);
   });
 
+  it("returns a PNG with exactly the input dimensions", async () => {
+    const width = 73; const height = 41;
+    const source = await sharp({ create: { width, height, channels: 3, background: "#f4f0ef" } }).jpeg().toBuffer();
+    const result = await cleanImageInMemory({ image: source, mimeType: "image/jpeg", quality: "balanced" });
+    expect({ width: result.width, height: result.height }).toEqual({ width, height });
+    await expect(sharp(result.image).metadata()).resolves.toMatchObject({ width, height });
+  });
+
   it("keeps neutral white bubbles on the local repair path and sends coloured bubbles to the trained path", () => {
     const white = Buffer.alloc(80 * 80 * 4, 255);
     const red = Buffer.alloc(80 * 80 * 4, 255);
@@ -116,5 +124,16 @@ describe("manga bubble cleanup safeguards", () => {
     const regions = await detectFallbackDarkTextRegions(image, width, height);
     expect(regions).toHaveLength(1);
     expect(regions[0]).toMatchObject({ x: 55, y: 40, width: 87, height: 20 });
+  });
+
+  it("can include dark dialogue over a smooth coloured backdrop only when detailed repair is enabled", async () => {
+    const width = 200; const height = 100; const raw = Buffer.alloc(width * height * 4, 255);
+    for (let pixel = 0; pixel < width * height; pixel += 1) { raw[pixel * 4] = 126; raw[pixel * 4 + 1] = 38; raw[pixel * 4 + 2] = 52; }
+    for (let glyph = 0; glyph < 7; glyph += 1) for (let y = 40; y < 60; y += 1) for (let x = 55 + glyph * 13; x < 64 + glyph * 13; x += 1) {
+      const offset = (y * width + x) * 4; raw[offset] = 18; raw[offset + 1] = 12; raw[offset + 2] = 14;
+    }
+    const image = await sharp(raw, { raw: { width, height, channels: 4 } }).png().toBuffer();
+    await expect(detectFallbackDarkTextRegions(image, width, height)).resolves.toEqual([]);
+    await expect(detectFallbackDarkTextRegions(image, width, height, true)).resolves.toHaveLength(1);
   });
 });

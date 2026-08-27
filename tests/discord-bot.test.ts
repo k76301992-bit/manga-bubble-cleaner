@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { validateDiscordImageAttachment } from "../server/standalone/discord-bot";
+import { originalDiscordAttachmentUrl, validateDiscordImageAttachment } from "../server/standalone/discord-bot";
 
 describe("Discord image intake", () => {
   it("accepts an HTTPS PNG below the memory-only processing limit", () => {
     expect(validateDiscordImageAttachment({ url: "https://cdn.discordapp.com/attachments/1/2/page.png", name: "page.png", size: 1024, contentType: "image/png" } as never)).toBeUndefined();
+  });
+
+  it("removes media-proxy resize parameters while preserving the original Discord attachment path", () => {
+    expect(originalDiscordAttachmentUrl("https://media.discordapp.net/attachments/1/2/page.png?width=178&height=3837&ex=abc&is=def&hm=123")).toBe("https://cdn.discordapp.com/attachments/1/2/page.png?ex=abc&is=def&hm=123");
   });
 
   it("rejects non-image, insecure, and oversized attachments before downloading them", () => {

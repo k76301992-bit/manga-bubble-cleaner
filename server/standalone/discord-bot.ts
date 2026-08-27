@@ -31,6 +31,16 @@ function isDiscordCdn(value: string) {
   } catch { return false; }
 }
 
+/** Discord's media proxy may append width/height thumbnail parameters. */
+export function originalDiscordAttachmentUrl(value: string) {
+  const url = new URL(value);
+  if (url.hostname.toLowerCase() === "media.discordapp.net") url.hostname = "cdn.discordapp.com";
+  url.searchParams.delete("width");
+  url.searchParams.delete("height");
+  url.searchParams.delete("quality");
+  return url.toString();
+}
+
 function mimeTypeForAttachment(attachment: DiscordAttachmentInput) {
   const declared = attachment.contentType?.split(";")[0].toLowerCase();
   return declared && ["image/png", "image/jpeg", "image/webp"].includes(declared) ? declared : mimeTypeForFileName(attachment.name);
@@ -162,7 +172,7 @@ function modeButtons(session: ModeSession) {
 }
 
 async function fetchAttachmentBytes(attachment: DiscordAttachmentInput) {
-  const response = await fetch(attachment.url, { signal: AbortSignal.timeout(45_000) });
+  const response = await fetch(originalDiscordAttachmentUrl(attachment.url), { signal: AbortSignal.timeout(45_000) });
   if (!response.ok) throw new Error("تعذر تنزيل مرفق Discord المؤقت.");
   const buffer = Buffer.from(await response.arrayBuffer());
   if (buffer.length > MAX_ZIP_BYTES) throw new Error("حجم الملف بعد التنزيل يتجاوز الحد الآمن.");

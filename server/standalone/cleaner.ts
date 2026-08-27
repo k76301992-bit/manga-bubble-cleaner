@@ -48,7 +48,7 @@ function jsonCandidates(raw: string) {
   return [raw, ...fenced, firstObject >= 0 && lastObject > firstObject ? raw.slice(firstObject, lastObject + 1) : ""];
 }
 
-export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: number, height: number): Promise<BubbleTextRegion[]> {
+export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: number, height: number, includeSmoothColourBubbles = false): Promise<BubbleTextRegion[]> {
   const { data } = await sharp(imageBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const ink = new Uint8Array(width * height);
   for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
@@ -109,7 +109,10 @@ export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: 
     const chroma = colors.reduce((sum, color) => sum + (Math.max(color[0], color[1], color[2]) - Math.min(color[0], color[1], color[2])), 0) / colors.length;
     return lightness >= 210 && spread < 58 && chroma < 38;
   };
-  const accepted = uniqueRegions(lineGroups.filter((group) => group.glyphCount >= 1 && group.width >= 18 && group.width <= 620 && group.height >= 10 && group.height <= 150 && group.width / group.height >= 1.15 && likelySmoothLightBubble(group)).map(({ glyphCount: _glyphCount, ...region }) => region));
+  const accepted = uniqueRegions(lineGroups.filter((group) => {
+    const validTextShape = group.glyphCount >= 1 && group.width >= 18 && group.width <= 620 && group.height >= 10 && group.height <= 150 && group.width / group.height >= 1.15;
+    return validTextShape && (likelySmoothLightBubble(group) || (includeSmoothColourBubbles && hasSmoothBubbleBackdrop(data, width, height, group)));
+  }).map(({ glyphCount: _glyphCount, ...region }) => region));
   return accepted;
 }
 
@@ -143,7 +146,7 @@ async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, heigh
       model: EXTERNAL_QWEN_MODEL, temperature: 0, max_tokens: 1200, stream: false,
       messages: [{ role: "user", content: [
         { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:image/png;base64,${imageBuffer.toString("base64")}` } },
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBuffer.toString("base64")}` } },
       ] }],
     }),
   };
@@ -311,7 +314,16 @@ async function inpaintWithTrainedModel(source: Buffer, width: number, height: nu
     const cropImage = await sharp(cropRaw(output, width, height, left, top, cropWidth, cropHeight), { raw: { width: cropWidth, height: cropHeight, channels: 4 } }).png().toBuffer();
     const maskImage = await sharp(cropMask, { raw: { width: cropWidth, height: cropHeight, channels: 1 } }).png().toBuffer();
     const trained = await requestTrainedInpainting(cropImage, maskImage); if (!trained) continue;
+    const trainedMetadata = await sharp(trained.image).metadata();
+    if (trainedMetadata.width !== cropWidth || trainedMetadata.height !== cropHeight) {
+      console.warn("[cleaner] discarded trained crop with unexpected dimensions", { expected: `${cropWidth}x${cropHeight}`, received: `${trainedMetadata.width ?? 0}x${trainedMetadata.height ?? 0}` });
+      continue;
+    }
     const repaired = await sharp(trained.image).ensureAlpha().raw().toBuffer();
+    if (repaired.length !== cropWidth * cropHeight * 4) {
+      console.warn("[cleaner] discarded trained crop with unexpected raw byte length");
+      continue;
+    }
     for (let y = 0; y < cropHeight; y += 1) for (let x = 0; x < cropWidth; x += 1) if (cropMask[y * cropWidth + x]) repaired.copy(output, ((top + y) * width + left + x) * 4, (y * cropWidth + x) * 4, (y * cropWidth + x + 1) * 4);
     repairedRegions += 1;
   }
@@ -341,10 +353,11 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const coreTop = tileIndex * profile.tileHeight; const coreHeight = Math.min(profile.tileHeight, height - coreTop);
     const top = Math.max(0, coreTop - TILE_OVERLAP); const bottom = Math.min(height, coreTop + coreHeight + TILE_OVERLAP); const currentHeight = bottom - top;
     const tileData = Buffer.from(decoded.subarray(top * rowBytes, bottom * rowBytes));
-    const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).png().toBuffer();
+    // Detection only: JPEG significantly reduces the remote request size while preserving tile coordinates.
+    const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).jpeg({ quality: 92, chromaSubsampling: "4:4:4" }).toBuffer();
     await input.onTile?.({ tileIndex, tileCount, status: "detecting" });
-    const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight);
-    const remote = profile.useRemoteWhenLocalMisses && !remoteDetectionUnavailable && !local.length
+    const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, profile.useTrainedInpainting);
+    const remote = profile.useRemoteWhenLocalMisses && !remoteDetectionUnavailable
       ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs).catch((error) => {
         console.warn("[cleaner] remote detection skipped for one tile", error instanceof Error ? error.message : error);
         remoteDetectionUnavailable = true;
@@ -352,7 +365,7 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       })
       : [];
     if (remote.length) remoteDetectionTiles += 1;
-    const detected = uniqueRegions([...local, ...remote]); detectedRegions += detected.length;
+    const detected = remote.length ? uniqueRegions([...remote, ...local]) : uniqueRegions(local); detectedRegions += detected.length;
     const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)]);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
     const localRegions = profile.useTrainedInpainting ? regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : regions;
@@ -365,5 +378,7 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     repairedRaw.copy(output, coreTop * rowBytes, sourceStart, sourceStart + coreHeight * rowBytes);
   }
   const image = await sharp(output, { raw: { width, height, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
+  const outputMetadata = await sharp(image).metadata();
+  if (outputMetadata.width !== width || outputMetadata.height !== height) throw new Error("فشل التحقق من أبعاد الصورة الناتجة؛ لم تُرسل نتيجة غير مطابقة للمصدر.");
   return { image, width, height, tileCount, detectedRegions, remoteDetectionTiles, trainedInpaintRegions };
 }
