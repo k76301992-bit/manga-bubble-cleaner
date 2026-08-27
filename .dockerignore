@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.git
+.manus-logs
+node_modules
+dist
+tmp
+model-comparison
+model-comparison-samples
+*.zip
+*.log

@@ -1,4 +1,5 @@
 import sharp from "sharp";
+import { requestTrainedInpainting } from "./inpainting-client";
 
 export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
 export type BubbleTextRegion = { x: number; y: number; width: number; height: number };
@@ -21,12 +22,13 @@ type CleaningProfile = {
   tileHeight: number;
   requestTimeoutMs: number;
   useRemoteWhenLocalMisses: boolean;
+  useTrainedInpainting: boolean;
 };
 
 export function cleaningProfileFor(quality: CleaningQuality): CleaningProfile {
-  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, useRemoteWhenLocalMisses: false };
-  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 45_000, useRemoteWhenLocalMisses: true };
-  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 32_000, useRemoteWhenLocalMisses: true };
+  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, useRemoteWhenLocalMisses: false, useTrainedInpainting: false };
+  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 15_000, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
+  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
 }
 
 function colorDistance(a: Pixel, b: Pixel) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
@@ -239,6 +241,70 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
   return output;
 }
 
+function regionBackground(source: Buffer, width: number, height: number, region: BubbleTextRegion): Pixel {
+  const read = (x: number, y: number): Pixel => { const o = (clamp(y, 0, height - 1) * width + clamp(x, 0, width - 1)) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
+  const samples: Pixel[] = [];
+  const x0 = clamp(region.x - 3, 0, width - 1); const x1 = clamp(region.x + region.width + 3, 0, width - 1);
+  const y0 = clamp(region.y - 3, 0, height - 1); const y1 = clamp(region.y + region.height + 3, 0, height - 1);
+  for (let x = x0; x <= x1; x += 3) samples.push(read(x, y0), read(x, y1));
+  for (let y = y0; y <= y1; y += 3) samples.push(read(x0, y), read(x1, y));
+  return [median(samples.map((color) => color[0])), median(samples.map((color) => color[1])), median(samples.map((color) => color[2])), 255];
+}
+
+function expandBinaryMask(mask: Uint8Array, width: number, height: number, passes: number) {
+  let current = mask;
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = new Uint8Array(current);
+    for (let y = 1; y < height - 1; y += 1) for (let x = 1; x < width - 1; x += 1) if (current[y * width + x]) {
+      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * width + x + dx] = 255;
+    }
+    current = next;
+  }
+  return current;
+}
+
+export function buildTrainedInpaintMask(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
+  const mask = new Uint8Array(width * height);
+  const read = (x: number, y: number): Pixel => { const o = (y * width + x) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
+  for (const region of uniqueRegions(regions)) {
+    const background = regionBackground(source, width, height, region);
+    const x0 = clamp(region.x, 1, width - 2); const y0 = clamp(region.y, 1, height - 2);
+    const x1 = clamp(region.x + region.width, x0 + 1, width - 2); const y1 = clamp(region.y + region.height, y0 + 1, height - 2);
+    for (let y = y0; y < y1; y += 1) for (let x = x0; x < x1; x += 1) {
+      const pixel = read(x, y);
+      const brightDifference = Math.abs(brightness(pixel) - brightness(background));
+      if (pixel[3] > 180 && (colorDistance(pixel, background) > 48 || brightDifference > 38)) mask[y * width + x] = 255;
+    }
+  }
+  return expandBinaryMask(mask, width, height, 3);
+}
+
+function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: number, top: number, cropWidth: number, cropHeight: number) {
+  const output = Buffer.alloc(cropWidth * cropHeight * 4); const rowBytes = pageWidth * 4;
+  for (let row = 0; row < cropHeight; row += 1) source.copy(output, row * cropWidth * 4, (top + row) * rowBytes + left * 4, (top + row) * rowBytes + (left + cropWidth) * 4);
+  return output;
+}
+
+async function inpaintWithTrainedModel(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
+  let output = Buffer.from(source); const globalMask = buildTrainedInpaintMask(source, width, height, regions); let repairedRegions = 0;
+  for (const region of uniqueRegions(regions)) {
+    const padding = clamp(Math.round(Math.max(region.width, region.height) * 0.35), 32, 128);
+    const left = clamp(region.x - padding, 0, width - 1); const top = clamp(region.y - padding, 0, height - 1);
+    const right = clamp(region.x + region.width + padding, left + 1, width); const bottom = clamp(region.y + region.height + padding, top + 1, height);
+    const cropWidth = right - left; const cropHeight = bottom - top; const cropMask = Buffer.alloc(cropWidth * cropHeight);
+    let hasMask = false;
+    for (let y = 0; y < cropHeight; y += 1) for (let x = 0; x < cropWidth; x += 1) { const value = globalMask[(top + y) * width + left + x]; cropMask[y * cropWidth + x] = value; hasMask ||= value > 0; }
+    if (!hasMask) continue;
+    const cropImage = await sharp(cropRaw(output, width, height, left, top, cropWidth, cropHeight), { raw: { width: cropWidth, height: cropHeight, channels: 4 } }).png().toBuffer();
+    const maskImage = await sharp(cropMask, { raw: { width: cropWidth, height: cropHeight, channels: 1 } }).png().toBuffer();
+    const trained = await requestTrainedInpainting(cropImage, maskImage); if (!trained) continue;
+    const repaired = await sharp(trained.image).ensureAlpha().raw().toBuffer();
+    for (let y = 0; y < cropHeight; y += 1) for (let x = 0; x < cropWidth; x += 1) if (cropMask[y * cropWidth + x]) repaired.copy(output, ((top + y) * width + left + x) * 4, (y * cropWidth + x) * 4, (y * cropWidth + x + 1) * 4);
+    repairedRegions += 1;
+  }
+  return { output, repairedRegions };
+}
+
 export function manualRegionsForTile(adjustments: ManualMaskAdjustment[] | undefined, pageWidth: number, pageHeight: number, tileTop: number, tileHeight: number) {
   return (adjustments ?? []).flatMap((adjustment) => {
     if (adjustment.mode !== "include" || adjustment.points.length < 2) return [];
@@ -257,7 +323,7 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
   const decoded = await sharp(input.image).ensureAlpha().raw().toBuffer();
   const output = Buffer.from(decoded);
   const rowBytes = width * 4;
-  const tileCount = Math.ceil(height / profile.tileHeight); let detectedRegions = 0; let remoteDetectionTiles = 0;
+  const tileCount = Math.ceil(height / profile.tileHeight); let detectedRegions = 0; let remoteDetectionTiles = 0; let trainedInpaintRegions = 0; let remoteDetectionUnavailable = false;
   for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
     const coreTop = tileIndex * profile.tileHeight; const coreHeight = Math.min(profile.tileHeight, height - coreTop);
     const top = Math.max(0, coreTop - TILE_OVERLAP); const bottom = Math.min(height, coreTop + coreHeight + TILE_OVERLAP); const currentHeight = bottom - top;
@@ -265,9 +331,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).png().toBuffer();
     await input.onTile?.({ tileIndex, tileCount, status: "detecting" });
     const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight);
-    const remote = profile.useRemoteWhenLocalMisses && !local.length
+    const remote = profile.useRemoteWhenLocalMisses && !remoteDetectionUnavailable && !local.length
       ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs).catch((error) => {
         console.warn("[cleaner] remote detection skipped for one tile", error instanceof Error ? error.message : error);
+        remoteDetectionUnavailable = true;
         return [] as BubbleTextRegion[];
       })
       : [];
@@ -275,10 +342,12 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const detected = uniqueRegions([...local, ...remote]); detectedRegions += detected.length;
     const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)]);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
-    const repairedRaw = inpaintDetectedTextBoxes(tileData, width, currentHeight, regions);
+    const trained = profile.useTrainedInpainting && regions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, regions) : undefined;
+    const repairedRaw = trained?.repairedRegions ? trained.output : inpaintDetectedTextBoxes(tileData, width, currentHeight, regions);
+    trainedInpaintRegions += trained?.repairedRegions ?? 0;
     const sourceStart = (coreTop - top) * rowBytes;
     repairedRaw.copy(output, coreTop * rowBytes, sourceStart, sourceStart + coreHeight * rowBytes);
   }
   const image = await sharp(output, { raw: { width, height, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
-  return { image, width, height, tileCount, detectedRegions, remoteDetectionTiles };
+  return { image, width, height, tileCount, detectedRegions, remoteDetectionTiles, trainedInpaintRegions };
 }
