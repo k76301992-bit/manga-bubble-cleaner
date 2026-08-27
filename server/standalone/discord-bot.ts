@@ -51,6 +51,10 @@ export function isDiscordZipAttachment(attachment: DiscordAttachmentInput) {
   return attachment.name.toLowerCase().endsWith(".zip") || declared === "application/zip" || declared === "application/x-zip-compressed";
 }
 
+export function hasZipSignature(bytes: Buffer) {
+  return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && ((bytes[2] === 0x03 && bytes[3] === 0x04) || (bytes[2] === 0x05 && bytes[3] === 0x06) || (bytes[2] === 0x07 && bytes[3] === 0x08));
+}
+
 export function validateDiscordImageAttachment(attachment: DiscordAttachmentInput) {
   if (!isDiscordCdn(attachment.url)) return "يجب أن يكون الملف مرفقًا من Discord نفسه عبر HTTPS.";
   if (!mimeTypeForAttachment(attachment)) return "ارفع صور PNG أو JPG أو WebP فقط.";
@@ -194,6 +198,13 @@ export async function sourceFromDiscordAttachments(attachments: DiscordAttachmen
     const invalid = validateDiscordZipAttachment(zipFiles[0]);
     if (invalid) throw new Error(invalid);
     return { kind: "zip", sourceName: zipFiles[0].name.replace(/\.zip$/i, ""), images: await extractImagesFromZip(await fetchAttachmentBytes(zipFiles[0])) };
+  }
+  if (attachments.length === 1 && !mimeTypeForAttachment(attachments[0])) {
+    const candidate = attachments[0];
+    if (!isDiscordCdn(candidate.url)) throw new Error("يجب أن يكون الملف مرفقًا من Discord نفسه عبر HTTPS.");
+    if (!candidate.size || candidate.size > MAX_ZIP_BYTES) throw new Error("يجب ألا يتجاوز الملف 50 ميغابايت.");
+    const bytes = await fetchAttachmentBytes(candidate);
+    if (hasZipSignature(bytes)) return { kind: "zip", sourceName: candidate.name.replace(/\.zip$/i, "") || "discord-archive", images: await extractImagesFromZip(bytes) };
   }
   if (attachments.length > MAX_IMAGES_PER_BATCH) throw new Error(`الحد الأقصى هو ${MAX_IMAGES_PER_BATCH} صور في العملية الواحدة.`);
   const images: BatchImage[] = [];

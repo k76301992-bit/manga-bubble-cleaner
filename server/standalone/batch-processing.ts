@@ -20,6 +20,12 @@ export function mimeTypeForFileName(value: string) {
   return extension === ".png" ? "image/png" : extension === ".jpg" || extension === ".jpeg" ? "image/jpeg" : extension === ".webp" ? "image/webp" : undefined;
 }
 
+export function isArchiveMetadataEntry(value: string) {
+  const segments = value.split("/");
+  const fileName = basename(value);
+  return segments.includes("__MACOSX") || fileName.startsWith("._") || fileName === ".DS_Store";
+}
+
 export function naturalNameCompare(a: string, b: string) {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
@@ -44,7 +50,7 @@ export function validateBatchImages(images: BatchImage[]) {
 export async function extractImagesFromZip(zipBuffer: Buffer): Promise<BatchImage[]> {
   if (!zipBuffer.length || zipBuffer.length > MAX_ZIP_BYTES) throw new Error("ملف ZIP يتجاوز حد 50 ميغابايت.");
   const archive = await JSZip.loadAsync(zipBuffer, { checkCRC32: false, createFolders: false });
-  const entries = Object.values(archive.files).filter((entry) => !entry.dir && mimeTypeForFileName(entry.name));
+  const entries = Object.values(archive.files).filter((entry) => !entry.dir && !isArchiveMetadataEntry(entry.name) && mimeTypeForFileName(entry.name));
   if (!entries.length) throw new Error("لا يحتوي ZIP على صور PNG أو JPG أو WebP.");
   if (entries.length > MAX_IMAGES_PER_BATCH) throw new Error(`يحتوي ZIP على أكثر من ${MAX_IMAGES_PER_BATCH} صور.`);
   const declaredBytes = entries.reduce((total, entry) => total + Number((entry as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0), 0);

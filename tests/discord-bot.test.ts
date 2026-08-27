@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it, vi } from "vitest";
-import { isDiscordZipAttachment, originalDiscordAttachmentUrl, sourceFromDiscordAttachments, validateDiscordImageAttachment, validateDiscordZipAttachment } from "../server/standalone/discord-bot";
+import { hasZipSignature, isDiscordZipAttachment, originalDiscordAttachmentUrl, sourceFromDiscordAttachments, validateDiscordImageAttachment, validateDiscordZipAttachment } from "../server/standalone/discord-bot";
 
 describe("Discord image intake", () => {
   it("accepts an HTTPS PNG below the memory-only processing limit", () => {
@@ -33,6 +33,18 @@ describe("Discord image intake", () => {
     } finally {
       fetchMock.mockRestore();
     }
+  });
+
+  it("routes an extensionless Discord upload by its ZIP byte signature", async () => {
+    const zip = new JSZip(); zip.file("IMG_7482.webp", Buffer.from([1, 2, 3]));
+    const archive = Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(Uint8Array.from(archive)));
+    try {
+      const source = await sourceFromDiscordAttachments([{ url: "https://cdn.discordapp.com/attachments/1/2/upload", name: "upload", size: archive.length, contentType: "application/octet-stream" } as never]);
+      expect(hasZipSignature(archive)).toBe(true);
+      expect(source.kind).toBe("zip");
+      expect(source.images.map((image) => image.name)).toEqual(["IMG_7482.webp"]);
+    } finally { fetchMock.mockRestore(); }
   });
 
   it("rejects non-image, insecure, and oversized attachments before downloading them", () => {

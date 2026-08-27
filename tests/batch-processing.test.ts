@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { createResultZip, extractImagesFromZip, MAX_IMAGES_PER_BATCH, naturalNameCompare, outputNameForSource, validateBatchImages } from "../server/standalone/batch-processing";
+import { createResultZip, extractImagesFromZip, isArchiveMetadataEntry, MAX_IMAGES_PER_BATCH, naturalNameCompare, outputNameForSource, validateBatchImages } from "../server/standalone/batch-processing";
 import { parseGoogleDriveUrl } from "../server/standalone/google-drive";
 
 describe("batch processing sources", () => {
@@ -16,6 +16,16 @@ describe("batch processing sources", () => {
     zip.file("chapter/readme.txt", "ignored");
     const images = await extractImagesFromZip(Buffer.from(await zip.generateAsync({ type: "nodebuffer" })));
     expect(images.map((image) => image.name)).toEqual(["page-2.png", "page-10.webp"]);
+  });
+
+  it("ignores macOS resource forks that misleadingly end in image extensions", async () => {
+    const zip = new JSZip();
+    zip.file("IMG_7482.webp", Buffer.from([1, 2, 3]));
+    zip.file("__MACOSX/._IMG_7482.webp", Buffer.from([0, 1, 2, 3]));
+    zip.file("chapter/._IMG_7546.jpeg", Buffer.from([0, 1]));
+    const images = await extractImagesFromZip(Buffer.from(await zip.generateAsync({ type: "nodebuffer" })));
+    expect(images.map((image) => image.name)).toEqual(["IMG_7482.webp"]);
+    expect(isArchiveMetadataEntry("__MACOSX/._IMG_7482.webp")).toBe(true);
   });
 
   it("allows a twelve-page chapter while retaining a total-memory limit", () => {
