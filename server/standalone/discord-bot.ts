@@ -316,26 +316,29 @@ async function startWizard(channel: TextChannel, userId: string) {
 }
 
 async function handleModeButton(interaction: ButtonInteraction) {
+  // A button interaction has only a short ACK window. Acknowledge it before any
+  // session validation or source collector is started; subsequent UI work is a message edit.
+  await interaction.deferUpdate();
   const [, rawSessionId, rawQuality] = interaction.customId.split(":");
   const session = modeSessions.get(rawSessionId);
   if (!session || session.channelId !== interaction.channelId || Date.now() - session.createdAt > 15 * 60_000) {
-    await interaction.reply({ content: "انتهى وقت هذه اللوحة. ابدأ `/clean` من جديد.", flags: EPHEMERAL });
+    await interaction.followUp({ content: "انتهى وقت هذه اللوحة. ابدأ `/clean` من جديد.", flags: EPHEMERAL });
     return;
   }
   if (session.userId !== interaction.user.id) {
-    await interaction.reply({ content: "هذه اللوحة ليست لك. استخدم `/clean` لإنشاء لوحة خاصة بتدفقك.", flags: EPHEMERAL });
+    await interaction.followUp({ content: "هذه اللوحة ليست لك. استخدم `/clean` لإنشاء لوحة خاصة بتدفقك.", flags: EPHEMERAL });
     return;
   }
   const channel = interaction.channel;
   if (!channel?.isTextBased() || !interaction.inGuild()) {
-    await interaction.reply({ content: "استخدم البوت داخل قناة نصية في خادم Discord.", flags: EPHEMERAL });
+    await interaction.followUp({ content: "استخدم البوت داخل قناة نصية في خادم Discord.", flags: EPHEMERAL });
     return;
   }
   modeSessions.delete(session.id);
   const quality: CleaningQuality = rawQuality === "maximum-detail" ? "maximum-detail" : "balanced";
   // Attach the collector first so a ZIP sent immediately after tapping the mode is not lost.
   const sourceMessagePromise = awaitSourceMessage(channel as TextChannel, interaction.user.id);
-  await interaction.update({ content: `✅ تم اختيار **${qualityLabel(quality)}**. أرسل المصدر في القناة التالية.` , components: [] });
+  await interaction.message.edit({ content: `✅ تم اختيار **${qualityLabel(quality)}**. أرسل المصدر في القناة التالية.` , components: [] } as never);
   await sendPanel(channel as TextChannel, sourceSections());
   void runCleaningFlow(channel as TextChannel, interaction.user.id, quality, sourceMessagePromise);
 }
@@ -424,6 +427,7 @@ export function startDiscordBot() {
     } catch (error) { console.error("[discord] command registration failed", error instanceof Error ? error.message : error); }
   });
   client.on(Events.InteractionCreate, (interaction) => {
+    console.info(`[discord] interaction received id=${interaction.id} type=${interaction.type} command=${interaction.isChatInputCommand() ? interaction.commandName : interaction.isButton() ? interaction.customId : "other"}`);
     void routeInteraction(interaction).catch((error) => {
       if (interaction.isRepliable()) void reportInteractionFailure(interaction as unknown as Parameters<typeof reportInteractionFailure>[0], error);
       else console.error("[discord] non-repliable interaction failed", error instanceof Error ? error.message : error);
@@ -431,5 +435,6 @@ export function startDiscordBot() {
   });
   client.on(Events.MessageCreate, (message) => { void handlePrefixCommand(message).catch((error) => console.error("[discord] prefix command failed", error instanceof Error ? error.message : error)); });
   client.on(Events.Error, (error) => console.error("[discord] client error", error.message));
+  client.on(Events.Warn, (warning) => console.warn("[discord] client warning", warning));
   client.login(process.env.DISCORD_BOT_TOKEN!.trim()).catch((error) => console.error("[discord] login failed", error instanceof Error ? error.message : error));
 }
