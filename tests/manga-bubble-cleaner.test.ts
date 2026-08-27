@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-
+import sharp from "sharp";
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions } from "../server/standalone/cleaner";
+import { detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions } from "../server/standalone/cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("normalizes incomplete local settings without weakening the quality default", () => {
@@ -75,5 +75,17 @@ describe("manga bubble cleanup safeguards", () => {
     const region = { x: 18, y: 18, width: 12, height: 10 };
     expect(hasSmoothBubbleBackdrop(smooth, 48, 48, region)).toBe(true);
     expect(hasSmoothBubbleBackdrop(textured, 48, 48, region)).toBe(false);
+  });
+
+  it("finds a connected dark dialogue line inside a smooth low-saturation bubble when Qwen is unavailable", async () => {
+    const width = 200; const height = 100; const raw = Buffer.alloc(width * height * 4, 255);
+    for (let pixel = 0; pixel < width * height; pixel += 1) { raw[pixel * 4] = 246; raw[pixel * 4 + 1] = 232; raw[pixel * 4 + 2] = 236; }
+    for (let glyph = 0; glyph < 7; glyph += 1) for (let y = 40; y < 60; y += 1) for (let x = 55 + glyph * 13; x < 64 + glyph * 13; x += 1) {
+      const offset = (y * width + x) * 4; raw[offset] = 42; raw[offset + 1] = 20; raw[offset + 2] = 24;
+    }
+    const image = await sharp(raw, { raw: { width, height, channels: 4 } }).png().toBuffer();
+    const regions = await detectFallbackDarkTextRegions(image, width, height);
+    expect(regions).toHaveLength(1);
+    expect(regions[0]).toMatchObject({ x: 55, y: 40, width: 87, height: 20 });
   });
 });

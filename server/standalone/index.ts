@@ -1,13 +1,11 @@
 import express, { type NextFunction, type Request, type Response } from "express";
-import sharp, { type Metadata } from "sharp";
-import { randomUUID } from "crypto";
-import { cleanImageInMemory, type CleaningQuality, type ManualMaskAdjustment } from "./cleaner";
-import { createProcessingJob, getProcessingJob, updateProcessingJob } from "./job-store";
+import sharp from "sharp";
+import { type CleaningQuality, type ManualMaskAdjustment } from "./cleaner";
+import { startDiscordBot } from "./discord-bot";
+import { ProcessingRequestError, processImageInMemory, supportedImageTypes } from "./processing-service";
+import { getProcessingJob } from "./job-store";
 
-const supportedTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const qualities = new Set<CleaningQuality>(["balanced", "preserve-detail", "maximum-detail"]);
-const cleanName = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 96) || "manhwa-page";
-let cleaningInProgress = false;
 
 function hasValidServiceKey(authorization: string | undefined) {
   const requiredKey = process.env.SERVICE_API_KEY?.trim();
@@ -46,38 +44,25 @@ async function startServer() {
     if (!job) return res.status(404).json({ error: "Job غير موجود." });
     return res.json(job);
   });
-  app.post("/api/v1/clean", express.raw({ type: [...supportedTypes], limit: "20mb" }), async (req, res) => {
+  app.post("/api/v1/clean", express.raw({ type: [...supportedImageTypes], limit: "20mb" }), async (req, res) => {
     if (!hasValidServiceKey(req.headers.authorization)) return res.status(401).json({ error: "مفتاح خدمة غير صالح." });
     const mimeType = (req.headers["content-type"] ?? "").split(";")[0].toLowerCase();
-    const fileName = cleanName(typeof req.headers["x-file-name"] === "string" ? req.headers["x-file-name"] : "manhwa-page");
+    const fileName = typeof req.headers["x-file-name"] === "string" ? req.headers["x-file-name"] : "manhwa-page";
     const requestedQuality = typeof req.headers["x-cleaning-quality"] === "string" ? req.headers["x-cleaning-quality"] as CleaningQuality : "preserve-detail";
     const quality = qualities.has(requestedQuality) ? requestedQuality : "preserve-detail";
-    if (!supportedTypes.has(mimeType) || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: "أرسل ملف PNG أو JPG أو WebP في جسم الطلب." });
-    if (cleaningInProgress) return res.status(429).json({ error: "server-busy", message: "الخادم يعالج صفحة أخرى الآن؛ أعد المحاولة بعد انتهائها." });
-    let metadata: Metadata;
-    try { metadata = await sharp(req.body, { animated: false }).metadata(); }
-    catch { return res.status(422).json({ error: "تعذر قراءة ملف الصورة." }); }
-    if (!metadata.width || !metadata.height || metadata.width * metadata.height > 20_000_000) return res.status(413).json({ error: "أبعاد الصورة تتجاوز الحد الذاكري الآمن للخادم (20 مليون بكسل)." });
-    cleaningInProgress = true;
-    const id = randomUUID(); await createProcessingJob({ id, fileName, mimeType }); res.setHeader("X-Cleaner-Job-Id", id);
     try {
-      const result = await cleanImageInMemory({ image: req.body, mimeType, quality, maskAdjustments: parseAdjustments(typeof req.headers["x-mask-adjustments"] === "string" ? req.headers["x-mask-adjustments"] : undefined), onTile: async ({ tileIndex, tileCount, status }) => { await updateProcessingJob(id, { status, completedTiles: status === "cleaning" ? tileIndex : tileIndex, tileCount }); } });
-      await updateProcessingJob(id, { status: "completed", completedTiles: result.tileCount, tileCount: result.tileCount, width: result.width, height: result.height });
-      res.setHeader("Cache-Control", "no-store"); res.type("image/png"); res.attachment(`${fileName.replace(/\.[^.]+$/, "")}-clean.png`); return res.send(result.image);
+      const result = await processImageInMemory({ image: req.body, mimeType, fileName, quality, maskAdjustments: parseAdjustments(typeof req.headers["x-mask-adjustments"] === "string" ? req.headers["x-mask-adjustments"] : undefined) });
+      res.setHeader("X-Cleaner-Job-Id", result.jobId); res.setHeader("Cache-Control", "no-store"); res.type("image/png"); res.attachment(`${result.fileName.replace(/\.[^.]+$/, "")}-clean.png`); return res.send(result.image);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "تعذرت معالجة الصورة.";
-      console.error(`[standalone-api] job ${id} failed: ${message}`);
-      await updateProcessingJob(id, { status: "failed", error: message });
-      return res.status(422).json({ jobId: id, error: message });
-    } finally {
-      cleaningInProgress = false;
+      if (error instanceof ProcessingRequestError) return res.status(error.statusCode).json({ jobId: error.jobId, error: error.code, message: error.message });
+      console.error("[standalone-api] unexpected processing error", error); return res.status(500).json({ error: "خطأ غير متوقع في خادم المعالجة." });
     }
   });
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (typeof error === "object" && error && "type" in error && (error as { type?: string }).type === "entity.too.large") return res.status(413).json({ error: "الصورة تتجاوز حد 20 ميغابايت." });
     console.error(error); return res.status(500).json({ error: "خطأ غير متوقع في خادم المعالجة." });
   });
-  const port = Number(process.env.PORT || 3000); app.listen(port, "0.0.0.0", () => console.log(`[standalone-api] listening on ${port}`));
+  const port = Number(process.env.PORT || 3000); app.listen(port, "0.0.0.0", () => { console.log(`[standalone-api] listening on ${port}`); startDiscordBot(); });
 }
 
 startServer().catch((error) => { console.error(error); process.exitCode = 1; });

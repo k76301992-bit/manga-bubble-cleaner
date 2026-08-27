@@ -9,6 +9,7 @@ const MAX_WIDTH = 12000;
 const MAX_HEIGHT = 30000;
 export const TILE_HEIGHT = 1200;
 const EXTERNAL_QWEN_BASE_URL = process.env.EXTERNAL_QWEN_BASE_URL || "https://ggg-production-739f.up.railway.app/v1";
+const EXTERNAL_QWEN_MODEL = process.env.EXTERNAL_QWEN_MODEL || "qwen";
 const SUPPORTED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
@@ -32,6 +33,71 @@ function jsonCandidates(raw: string) {
   return [raw, ...fenced, firstObject >= 0 && lastObject > firstObject ? raw.slice(firstObject, lastObject + 1) : ""];
 }
 
+export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: number, height: number): Promise<BubbleTextRegion[]> {
+  const { data } = await sharp(imageBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const ink = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+    const offset = (y * width + x) * 4; const red = data[offset]; const green = data[offset + 1]; const blue = data[offset + 2];
+    const brightness = (red * 0.299) + (green * 0.587) + (blue * 0.114);
+    if (data[offset + 3] > 200 && brightness < 150) ink[y * width + x] = 1;
+  }
+  const visited = new Uint8Array(width * height);
+  const glyphs: Array<{ x: number; y: number; width: number; height: number }> = [];
+  for (let start = 0; start < ink.length; start += 1) {
+    if (!ink[start] || visited[start]) continue;
+    const stack = [start]; visited[start] = 1; let count = 0; let minX = width; let minY = height; let maxX = 0; let maxY = 0;
+    while (stack.length) {
+      const point = stack.pop()!; const x = point % width; const y = Math.floor(point / width); count += 1;
+      minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+        const nx = x + dx; const ny = y + dy; const next = ny * width + nx;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height && ink[next] && !visited[next]) { visited[next] = 1; stack.push(next); }
+      }
+    }
+    const glyphWidth = maxX - minX + 1; const glyphHeight = maxY - minY + 1;
+    if (count >= 8 && glyphWidth >= 2 && glyphWidth <= 620 && glyphHeight >= 4 && glyphHeight <= 100) glyphs.push({ x: minX, y: minY, width: glyphWidth, height: glyphHeight });
+  }
+  glyphs.sort((a, b) => a.y - b.y || a.x - b.x);
+  const groups: Array<BubbleTextRegion & { glyphCount: number }> = [];
+  for (const glyph of glyphs) {
+    const centerY = glyph.y + glyph.height / 2;
+    const group = groups.find((candidate) => {
+      const candidateCenterY = candidate.y + candidate.height / 2;
+      const horizontalGap = glyph.x > candidate.x + candidate.width ? glyph.x - (candidate.x + candidate.width) : candidate.x > glyph.x + glyph.width ? candidate.x - (glyph.x + glyph.width) : 0;
+      return Math.abs(centerY - candidateCenterY) <= Math.max(18, Math.max(glyph.height, candidate.height) * 0.75) && horizontalGap <= 34;
+    });
+    if (!group) groups.push({ ...glyph, glyphCount: 1 });
+    else {
+      const right = Math.max(group.x + group.width, glyph.x + glyph.width); const bottom = Math.max(group.y + group.height, glyph.y + glyph.height);
+      group.x = Math.min(group.x, glyph.x); group.y = Math.min(group.y, glyph.y); group.width = right - group.x; group.height = bottom - group.y; group.glyphCount += 1;
+    }
+  }
+  const lineGroups: Array<BubbleTextRegion & { glyphCount: number }> = [];
+  for (const group of [...groups].sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const groupCenterY = group.y + group.height / 2;
+    const existing = lineGroups.find((candidate) => {
+      const candidateCenterY = candidate.y + candidate.height / 2;
+      const horizontalGap = group.x > candidate.x + candidate.width ? group.x - (candidate.x + candidate.width) : candidate.x > group.x + group.width ? candidate.x - (group.x + group.width) : 0;
+      return Math.abs(groupCenterY - candidateCenterY) <= Math.max(18, Math.max(group.height, candidate.height) * 0.75) && horizontalGap <= 42;
+    });
+    if (!existing) lineGroups.push({ ...group });
+    else {
+      const right = Math.max(existing.x + existing.width, group.x + group.width); const bottom = Math.max(existing.y + existing.height, group.y + group.height);
+      existing.x = Math.min(existing.x, group.x); existing.y = Math.min(existing.y, group.y); existing.width = right - existing.x; existing.height = bottom - existing.y; existing.glyphCount += group.glyphCount;
+    }
+  }
+  const read = (x: number, y: number): Pixel => { const offset = (clamp(y, 0, height - 1) * width + clamp(x, 0, width - 1)) * 4; return [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]; };
+  const likelySmoothLightBubble = (region: BubbleTextRegion) => {
+    const samples = [[region.x - 7, region.y + region.height / 2], [region.x + region.width + 7, region.y + region.height / 2], [region.x + region.width / 2, region.y - 7], [region.x + region.width / 2, region.y + region.height + 7]];
+    const colors = samples.map(([x, y]) => read(Math.round(x), Math.round(y))); const lightness = colors.reduce((sum, color) => sum + ((color[0] * 0.299) + (color[1] * 0.587) + (color[2] * 0.114)), 0) / colors.length;
+    const spread = Math.max(...colors.map((color) => colorDistance(color, colors[0])));
+    const chroma = colors.reduce((sum, color) => sum + (Math.max(color[0], color[1], color[2]) - Math.min(color[0], color[1], color[2])), 0) / colors.length;
+    return lightness >= 175 && spread < 90 && chroma < 80;
+  };
+  const accepted = uniqueRegions(lineGroups.filter((group) => group.glyphCount >= 1 && group.width >= 18 && group.width <= 620 && group.height >= 10 && group.height <= 150 && group.width / group.height >= 1.15 && likelySmoothLightBubble(group)).map(({ glyphCount: _glyphCount, ...region }) => region));
+  return accepted;
+}
+
 export function parseQwenBubbleRegions(raw: string, width: number, height: number): BubbleTextRegion[] {
   for (const candidate of jsonCandidates(raw)) {
     try {
@@ -52,22 +118,47 @@ export function parseQwenBubbleRegions(raw: string, width: number, height: numbe
 
 async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, height: number) {
   const apiKey = process.env.EXTERNAL_OPENAI_API_KEY;
-  if (!apiKey) throw new Error("مفتاح موفر كشف النص غير مضبوط على الخادم.");
-  const prompt = `Inspect this ${width}x${height} manhwa crop. Return one JSON object only: {"coordinate_space":"pixels","regions":[{"kind":"dialogue"|"caption","bbox_2d":[ymin,xmin,ymax,xmax]}]}. Find readable dialogue or narration text inside a closed speech bubble or caption box. Each bbox must be tight around text ink, including fill, outline, glow, and shadow, but never include a bubble border, tail, or empty background. Ignore logos, sound effects, panel borders, and text outside closed bubbles. Use exact pixel coordinates. If there is no eligible text, return {"coordinate_space":"pixels","regions":[]}.`;
-  const response = await fetch(`${EXTERNAL_QWEN_BASE_URL}/chat/completions`, {
+  if (!apiKey) throw new Error("مفتاح موفر كشف النص غير مضبوط.");
+  if (imageBuffer.length > MAX_INPUT_BYTES) throw new Error("مقطع الصورة أكبر من حد موفر كشف النص.");
+  const prompt = `Inspect this ${width}x${height} manhwa crop. Return one JSON object only: {"coordinate_space":"pixels","regions":[{"kind":"dialogue"|"caption","bbox_2d":[ymin,xmin,ymax,xmax],"text":"optional"}]}. Find every readable dialogue or narration text group inside a closed speech bubble or caption box, including white, yellow, red, black, translucent, patterned, or gradient fills. Each bbox must be TIGHT around visible text ink, including fill, outline, glow, and shadow, but never include the bubble border, tail, or empty bubble background. Ignore logos, sound effects, panel borders, and all lettering outside closed bubbles. Use exact pixel coordinates for this supplied image. If there is no eligible text, return {"coordinate_space":"pixels","regions":[]}.`;
+  const request = {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ model: "qwen", temperature: 0, max_tokens: 1200, stream: false, messages: [{ role: "user", content: [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: `data:image/png;base64,${imageBuffer.toString("base64")}` } }] }] }),
-    signal: AbortSignal.timeout(180_000),
-  });
-  const body = await response.text();
-  if (!response.ok) throw new Error(`تعذر كشف النص عبر الموفر الخارجي (${response.status}): ${body.slice(0, 240)}`);
-  try {
-    const payload = JSON.parse(body) as { choices?: Array<{ message?: { content?: unknown } }> };
-    const content = payload.choices?.[0]?.message?.content;
-    if (typeof content !== "string") throw new Error("invalid");
-    return uniqueRegions(parseQwenBubbleRegions(content, width, height));
-  } catch { throw new Error("رد موفر كشف النص ليس بصيغة JSON قابلة للتحليل."); }
+    body: JSON.stringify({
+      model: EXTERNAL_QWEN_MODEL, temperature: 0, max_tokens: 1200, stream: false,
+      messages: [{ role: "user", content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${imageBuffer.toString("base64")}` } },
+      ] }],
+    }),
+  };
+  for (let contentAttempt = 0; contentAttempt < 2; contentAttempt += 1) {
+    let response: Response | undefined;
+    let networkError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { response = await fetch(`${EXTERNAL_QWEN_BASE_URL}/chat/completions`, { ...request, signal: AbortSignal.timeout(180_000) }); break; }
+      catch (error) { networkError = error; if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 700)); }
+    }
+    if (!response) throw new Error(`تعذر الاتصال بموفر كشف النص بعد 3 محاولات: ${networkError instanceof Error ? networkError.message : "خطأ شبكة"}`);
+    const body = await response.text();
+    if (!response.ok) throw new Error(`تعذر كشف النص عبر الموفر الخارجي (${response.status}): ${body.slice(0, 240)}`);
+    try {
+      const payload = JSON.parse(body) as { choices?: Array<{ message?: { content?: unknown } }> };
+      const content = payload.choices?.[0]?.message?.content;
+      if (typeof content !== "string") throw new Error("رد موفر كشف النص لا يحتوي نصًا صالحًا.");
+      if (content.trim() === "[Qwen: empty response]") {
+        if (contentAttempt === 0) { await new Promise((resolve) => setTimeout(resolve, 600)); continue; }
+        const fallback = await detectFallbackDarkTextRegions(imageBuffer, width, height);
+        if (fallback.length) return fallback;
+        throw new Error("موفر كشف النص أعاد استجابة فارغة ولم يجد الفحص المحلي نصًا آمنًا للتبييض؛ لم تُعالج الصورة حتى لا يعيد الخادم نسخة غير منظفة.");
+      }
+      return uniqueRegions(parseQwenBubbleRegions(content, width, height));
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("رد موفر")) throw error;
+      throw new Error("رد موفر كشف النص ليس بصيغة JSON قابلة للتحليل.");
+    }
+  }
+  return [];
 }
 
 export function hasSmoothBubbleBackdrop(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
