@@ -31,17 +31,18 @@ export function validateDiscordImageAttachment(attachment: DiscordAttachmentInpu
 }
 
 async function registerCommand(client: Client) {
-  const guildId = process.env.DISCORD_GUILD_ID?.trim();
-  if (!guildId) throw new Error("DISCORD_GUILD_ID is required for the initial private bot deployment.");
-  const guild = await client.guilds.fetch(guildId);
-  await guild.commands.set([cleanCommand.toJSON()]);
+  if (!client.application) throw new Error("Discord application is not ready for global command registration.");
+  await client.application.commands.set([cleanCommand.toJSON()]);
+}
+
+export function isDiscordBotEnabled(environment: NodeJS.ProcessEnv = process.env) {
+  return environment.DISCORD_ENABLED === "true" && Boolean(environment.DISCORD_BOT_TOKEN?.trim());
 }
 
 export function startDiscordBot() {
   if (process.env.DISCORD_ENABLED !== "true") { console.info("[discord] bot disabled: set DISCORD_ENABLED=true to enable it"); return; }
   const token = process.env.DISCORD_BOT_TOKEN?.trim();
   if (!token) { console.info("[discord] bot disabled: DISCORD_BOT_TOKEN is not configured"); return; }
-  if (!process.env.DISCORD_GUILD_ID?.trim()) { console.info("[discord] bot disabled: DISCORD_GUILD_ID is required for the initial private deployment"); return; }
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
   client.once(Events.ClientReady, async (readyClient) => {
