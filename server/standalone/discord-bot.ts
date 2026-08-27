@@ -332,6 +332,38 @@ export function isDiscordBotEnabled(environment: NodeJS.ProcessEnv = process.env
   return environment.DISCORD_ENABLED === "true" && Boolean(environment.DISCORD_BOT_TOKEN?.trim());
 }
 
+function isUnknownInteractionError(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === 10062;
+}
+
+async function reportInteractionFailure(interaction: { replied: boolean; deferred: boolean; reply: (options: { content: string; flags: typeof EPHEMERAL }) => Promise<unknown>; followUp: (options: { content: string; flags: typeof EPHEMERAL }) => Promise<unknown> }, error: unknown) {
+  if (isUnknownInteractionError(error)) {
+    console.warn("[discord] ignored expired interaction");
+    return;
+  }
+  console.error("[discord] interaction handler failed", error instanceof Error ? error.message : error);
+  const message = "تعذّر إكمال التفاعل. ابدأ `/clean` مرة أخرى إذا كانت اللوحة قديمة.";
+  try {
+    if (interaction.replied || interaction.deferred) await interaction.followUp({ content: message, flags: EPHEMERAL });
+    else await interaction.reply({ content: message, flags: EPHEMERAL });
+  } catch (replyError) {
+    if (!isUnknownInteractionError(replyError)) console.error("[discord] failed to report interaction error", replyError instanceof Error ? replyError.message : replyError);
+  }
+}
+
+async function routeInteraction(interaction: Parameters<Client["emit"]>[1] & { isChatInputCommand: () => boolean; isButton: () => boolean }) {
+  if (interaction.isChatInputCommand()) {
+    const command = interaction as unknown as ChatInputCommandInteraction;
+    if (command.commandName === "clean") await handleClean(command);
+    if (command.commandName === "help") await handleHelp(command);
+    return;
+  }
+  if (interaction.isButton()) {
+    const button = interaction as unknown as ButtonInteraction;
+    if (button.customId.startsWith("mbc-mode:")) await handleModeButton(button);
+  }
+}
+
 export function startDiscordBot() {
   if (!isDiscordBotEnabled()) { console.info("[discord] bot disabled: set DISCORD_ENABLED=true and DISCORD_BOT_TOKEN"); return; }
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -342,14 +374,13 @@ export function startDiscordBot() {
       console.info(`[discord] ready as ${readyClient.user.tag}`);
     } catch (error) { console.error("[discord] command registration failed", error instanceof Error ? error.message : error); }
   });
-  client.on(Events.InteractionCreate, async (interaction) => {
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "clean") await handleClean(interaction);
-      if (interaction.commandName === "help") await handleHelp(interaction);
-      return;
-    }
-    if (interaction.isButton() && interaction.customId.startsWith("mbc-mode:")) await handleModeButton(interaction);
+  client.on(Events.InteractionCreate, (interaction) => {
+    void routeInteraction(interaction).catch((error) => {
+      if (interaction.isRepliable()) void reportInteractionFailure(interaction as unknown as Parameters<typeof reportInteractionFailure>[0], error);
+      else console.error("[discord] non-repliable interaction failed", error instanceof Error ? error.message : error);
+    });
   });
-  client.on(Events.MessageCreate, (message) => { void handlePrefixCommand(message); });
+  client.on(Events.MessageCreate, (message) => { void handlePrefixCommand(message).catch((error) => console.error("[discord] prefix command failed", error instanceof Error ? error.message : error)); });
+  client.on(Events.Error, (error) => console.error("[discord] client error", error.message));
   client.login(process.env.DISCORD_BOT_TOKEN!.trim()).catch((error) => console.error("[discord] login failed", error instanceof Error ? error.message : error));
 }
