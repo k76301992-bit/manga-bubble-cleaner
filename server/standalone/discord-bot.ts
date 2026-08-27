@@ -1,32 +1,28 @@
 import {
-  ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, Events,
-  GatewayIntentBits, MessageFlags, ModalBuilder, SlashCommandBuilder, TextInputBuilder, TextInputStyle,
-  type Attachment, type ButtonInteraction, type ChatInputCommandInteraction, type ModalSubmitInteraction,
+  ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, Events, GatewayIntentBits,
+  MessageFlags, SlashCommandBuilder, type Attachment, type ButtonInteraction, type ChatInputCommandInteraction,
+  type Message, type TextChannel,
 } from "discord.js";
 import { type CleaningQuality } from "./cleaner";
 import { cleanBatchInMemory, createResultZip, extractImagesFromZip, MAX_IMAGES_PER_BATCH, MAX_ZIP_BYTES, mimeTypeForFileName, type BatchImage } from "./batch-processing";
 import { createGoogleDriveResultFolder, readGoogleDriveSource } from "./google-drive";
 
+const V2_FLAG = MessageFlags.IsComponentsV2;
 const EPHEMERAL = MessageFlags.Ephemeral;
-const DRIVE_MODAL_ID = "mbc-drive-link";
-const ATTACHMENTS_BUTTON_ID = "mbc-source-attachments";
-const DRIVE_BUTTON_ID = "mbc-source-drive";
-const QUALITY_BUTTON_ID = "mbc-quality";
+const STATUS_HEARTBEAT_MS = 20_000;
+const SOURCE_TIMEOUT_MS = 5 * 60_000;
 const MAX_DISCORD_RESULT_BYTES = 24 * 1024 * 1024;
-const qualityChoices = [
-  { name: "حفظ التفاصيل — موصى به", value: "preserve-detail" },
-  { name: "متوازن", value: "balanced" },
-  { name: "تفاصيل قصوى", value: "maximum-detail" },
-] as const;
+const GOLD = 0xD5AA55;
+const RED = 0xD94A4A;
+const cleanCommand = new SlashCommandBuilder().setName("clean").setDescription("ابدأ تبييض فصل مانهوا أو صفحة واحدة");
+const helpCommand = new SlashCommandBuilder().setName("help").setDescription("تعليمات استخدام Manga Bubble Cleaner");
 
-const cleanCommand = new SlashCommandBuilder()
-  .setName("clean")
-  .setDescription("تنظيف نصوص فقاعات صفحة أو فصل مانهوا")
-  .addStringOption((option) => option.setName("quality").setDescription("مستوى الترميم").addChoices(...qualityChoices));
-const helpCommand = new SlashCommandBuilder().setName("help").setDescription("شرح مصادر الفصل وطريقة استلام النتيجة");
 type DiscordAttachmentInput = Pick<Attachment, "url" | "name" | "size" | "contentType">;
 type SourceKind = "discord-images" | "zip" | "drive";
 type SourceBatch = { kind: SourceKind; sourceName: string; images: BatchImage[] };
+type V2Component = Record<string, unknown>;
+type ModeSession = { id: string; userId: string; channelId: string; createdAt: number };
+const modeSessions = new Map<string, ModeSession>();
 
 function isDiscordCdn(value: string) {
   try {
@@ -54,35 +50,114 @@ function validateDiscordZipAttachment(attachment: DiscordAttachmentInput) {
   return undefined;
 }
 
-function qualityFor(value: string | null | undefined): CleaningQuality {
-  return value === "balanced" || value === "maximum-detail" ? value : "preserve-detail";
+function duration(seconds: number) {
+  const total = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(total / 60);
+  return minutes ? `${minutes}د ${total % 60}ث` : `${total}ث`;
 }
 
-function studioEmbed(quality: CleaningQuality) {
-  return new EmbedBuilder()
-    .setColor(0xC8A45C)
-    .setTitle("Manga Bubble Cleaner · استوديو التبييض")
-    .setDescription("اختر مصدر الفصل. تُحفظ الصور في الذاكرة أثناء المعالجة فقط، وتُعاد النتيجة بالطريقة المطابقة للمصدر.")
-    .addFields(
-      { name: "مرفقات Discord", value: `أرسل حتى ${MAX_IMAGES_PER_BATCH} صور مباشرة، أو ملف ZIP واحد. الصور تعود مرفقات، وZIP يعود ZIP.`, inline: false },
-      { name: "Google Drive", value: "ألصق رابط صورة أو ZIP أو مجلد مشترك مع حساب الخدمة؛ ينشأ مجلد نتائج جديد ويصل رابطُه إليك.", inline: false },
-      { name: "المستوى", value: quality === "maximum-detail" ? "تفاصيل قصوى" : quality === "balanced" ? "متوازن" : "حفظ التفاصيل", inline: true },
-    )
-    .setFooter({ text: "لا تُحفظ صورك ولا نتائجك على قرص الخادم." });
+function qualityLabel(quality: CleaningQuality) {
+  return quality === "maximum-detail" ? "دقة كاملة" : "سرعة عالية";
 }
 
-function qualityButtons() {
+function panel(sections: string[], options: { error?: boolean; files?: string[] } = {}): V2Component[] {
+  const children: V2Component[] = [];
+  sections.filter(Boolean).forEach((section, index) => {
+    if (index) children.push({ type: 14, divider: true, spacing: 1 });
+    children.push({ type: 10, content: section });
+  });
+  for (const name of options.files ?? []) {
+    children.push({ type: 14, divider: true, spacing: 1 });
+    children.push({ type: 13, file: { url: `attachment://${name}` } });
+  }
+  return [{ type: 17, accent_color: options.error ? RED : GOLD, components: children }];
+}
+
+function componentsOptions(components: V2Component[], extra: Record<string, unknown> = {}) {
+  return { ...extra, components: components as never, flags: V2_FLAG } as never;
+}
+
+async function sendPanel(channel: TextChannel, sections: string[], options: { error?: boolean; files?: string[]; attachments?: AttachmentBuilder[] } = {}) {
+  return channel.send(componentsOptions(panel(sections, options), options.attachments?.length ? { files: options.attachments } : {}));
+}
+
+function modeSections() {
+  return [
+    "## ⚙️ اختر وضع التبييض",
+    "### ⚡ سرعة عالية — موصى به\nيحافظ على التفاصيل ويعطي نتيجة أسرع لمعظم الصفحات. استخدمه افتراضيًا.",
+    "### ✅ دقة كاملة\nيعطي محرك الترميم وقتًا أطول للحالات الصعبة أو النص غير الواضح. قد تستغرق العملية وقتًا أطول للفصل الكامل.",
+  ];
+}
+
+function sourceSections() {
+  return [
+    "## 📂 خطوة إرفاق صور الفصل",
+    "## توجد ثلاث طرق لإرسال صور فصلك.",
+    `📷 **الطريقة الأولى:** أرفق حتى **${MAX_IMAGES_PER_BATCH}** صور مباشرة في رسالة واحدة، واحفظ ترتيب الصفحات في أسمائها.`,
+    "🗜️ **الطريقة الثانية:** أرسل ملف ZIP واحدًا يحتوي صور الفصل مرتبة بأسمائها؛ سيعود ZIP بالنتائج.",
+    "🗂️ **الطريقة الثالثة:** أرسل رابط Google Drive لصورة أو ZIP أو مجلد مشترك مع حساب الخدمة؛ سيُنشأ مجلد نتائج جديد ويُعاد رابطه.",
+  ];
+}
+
+function statusSections(stage: string, detail: string, current?: number, total?: number, heartbeat = 0) {
+  const progress = current !== undefined && total ? `**${current}/${total}**` : "`...`";
+  const pulse = "·".repeat((heartbeat % 3) + 1);
+  return [
+    `⏳ **الحالة:** ${stage}`,
+    `📊 **التقدم:** ${progress} ${pulse}`,
+    `ℹ️ ${detail}`,
+  ];
+}
+
+class CleaningStatus {
+  private heartbeat = 0;
+  private timer?: ReturnType<typeof setInterval>;
+  private closed = false;
+  private stage: string;
+  private detail: string;
+  private current?: number;
+  private total?: number;
+  private constructor(private readonly message: Message, stage: string, detail: string, current?: number, total?: number) {
+    this.stage = stage;
+    this.detail = detail;
+    this.current = current;
+    this.total = total;
+  }
+
+  static async create(channel: TextChannel, stage: string, detail: string, current?: number, total?: number) {
+    const message = await sendPanel(channel, statusSections(stage, detail, current, total));
+    const status = new CleaningStatus(message, stage, detail, current, total);
+    status.timer = setInterval(() => { void status.render(); }, STATUS_HEARTBEAT_MS);
+    return status;
+  }
+
+  async update(stage: string, detail: string, options: { error?: boolean; current?: number; total?: number } = {}) {
+    this.stage = stage;
+    this.detail = detail;
+    this.current = options.current;
+    this.total = options.total;
+    this.heartbeat += 1;
+    await this.render(options.error);
+  }
+
+  private async render(error = false) {
+    if (this.closed) return;
+    this.heartbeat += 1;
+    try { await this.message.edit({ components: panel(statusSections(this.stage, this.detail, this.current, this.total, this.heartbeat), { error }) as never } as never); }
+    catch { this.closed = true; if (this.timer) clearInterval(this.timer); }
+  }
+
+  async close(deleteMessage = true) {
+    this.closed = true;
+    if (this.timer) clearInterval(this.timer);
+    if (deleteMessage) { try { await this.message.delete(); } catch { /* Message may have been removed by a moderator. */ } }
+  }
+}
+
+function modeButtons(session: ModeSession) {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`${QUALITY_BUTTON_ID}:preserve-detail`).setLabel("حفظ التفاصيل").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`${QUALITY_BUTTON_ID}:balanced`).setLabel("متوازن").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${QUALITY_BUTTON_ID}:maximum-detail`).setLabel("تفاصيل قصوى").setStyle(ButtonStyle.Secondary),
-  );
-}
-
-function sourceButtons(quality: CleaningQuality) {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`${ATTACHMENTS_BUTTON_ID}:${quality}`).setLabel("مرفقات أو ZIP").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`${DRIVE_BUTTON_ID}:${quality}`).setLabel("Google Drive").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mbc-mode:${session.id}:balanced`).setLabel("سرعة عالية").setEmoji("⚡").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mbc-mode:${session.id}:maximum-detail`).setLabel("دقة كاملة").setEmoji("✅").setStyle(ButtonStyle.Secondary),
   );
 }
 
@@ -90,7 +165,7 @@ async function fetchAttachmentBytes(attachment: DiscordAttachmentInput) {
   const response = await fetch(attachment.url, { signal: AbortSignal.timeout(45_000) });
   if (!response.ok) throw new Error("تعذر تنزيل مرفق Discord المؤقت.");
   const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > Math.max(attachment.size ?? 0, MAX_ZIP_BYTES) || buffer.length > MAX_ZIP_BYTES) throw new Error("حجم الملف بعد التنزيل يتجاوز الحد الآمن.");
+  if (buffer.length > MAX_ZIP_BYTES) throw new Error("حجم الملف بعد التنزيل يتجاوز الحد الآمن.");
   return buffer;
 }
 
@@ -115,78 +190,137 @@ export async function sourceFromDiscordAttachments(attachments: DiscordAttachmen
   return { kind: "discord-images", sourceName: "discord-pages", images };
 }
 
-async function collectDiscordAttachments(interaction: ButtonInteraction) {
-  if (!interaction.inGuild() || !interaction.channel?.isTextBased()) throw new Error("استخدم هذا المسار داخل قناة نصية في خادم Discord.");
-  const channel = interaction.channel;
-  await interaction.editReply(`أرسل الآن حتى **${MAX_IMAGES_PER_BATCH}** صور، أو ملف ZIP واحد، في هذه القناة خلال خمس دقائق. سأقرأ رسالة المرفقات هذه فقط.`);
-  const messages = await channel.awaitMessages({ filter: (message) => message.author.id === interaction.user.id && message.attachments.size > 0, max: 1, time: 5 * 60_000, errors: ["time"] });
-  return [...messages.first()!.attachments.values()];
+async function awaitSourceMessage(channel: TextChannel, userId: string) {
+  const messages = await channel.awaitMessages({ filter: (message) => message.author.id === userId && (message.attachments.size > 0 || /^https:\/\//i.test(message.content.trim())), max: 1, time: SOURCE_TIMEOUT_MS, errors: ["time"] });
+  return messages.first()!;
 }
 
-async function deliverDiscordResult(interaction: ButtonInteraction | ModalSubmitInteraction, source: SourceBatch, results: Awaited<ReturnType<typeof cleanBatchInMemory>>) {
+async function sourceFromMessage(message: Message): Promise<SourceBatch> {
+  if (message.attachments.size) return sourceFromDiscordAttachments([...message.attachments.values()]);
+  const link = message.content.trim();
+  const driveSource = await readGoogleDriveSource(link);
+  return { ...driveSource, kind: "drive" };
+}
+
+async function sendFinalResult(channel: TextChannel, source: SourceBatch, results: Awaited<ReturnType<typeof cleanBatchInMemory>>, elapsed: number) {
   if (source.kind === "drive") {
     const folder = await createGoogleDriveResultFolder({ sourceName: source.sourceName, results });
-    await interaction.editReply(`اكتملت معالجة **${results.length}** صورة. أنشأت مجلد النتائج وشاركته للقراءة عبر الرابط التالي:\n${folder.url}`);
+    await sendPanel(channel, [
+      "## ✅ تم تبييض الفصل بنجاح",
+      `📷 تمت معالجة **${results.length}** صورة وحفظها داخل مجلد نتائج جديد في Google Drive.`,
+      `📊 تقرير العملية: المدة **${duration(elapsed)}**، وضع التسليم **Google Drive**.`,
+      `🔗 رابط المجلد: ${folder.url}`,
+    ]);
     return;
   }
   if (source.kind === "zip") {
-    const zip = await createResultZip(results);
-    await interaction.editReply({ content: `اكتملت معالجة **${results.length}** صورة. هذا ZIP الناتج:`, files: [new AttachmentBuilder(zip, { name: `${source.sourceName}-cleaned.zip` })] });
+    const archive = await createResultZip(results);
+    const fileName = `${source.sourceName}-cleaned.zip`;
+    await sendPanel(channel, [
+      "## ✅ تم تبييض الفصل بنجاح",
+      `📷 تمت معالجة **${results.length}** صورة وإرفاق ملف **${fileName}**.`,
+      `📊 تقرير العملية: المدة **${duration(elapsed)}**، وضع التسليم **ZIP**.`,
+    ], { files: [fileName], attachments: [new AttachmentBuilder(archive, { name: fileName })] });
     return;
   }
   const totalBytes = results.reduce((total, result) => total + result.image.length, 0);
-  if (totalBytes > MAX_DISCORD_RESULT_BYTES) throw new Error("نتائج الصور أكبر من حد الإرسال في Discord. أرسلها كملف ZIP أو استخدم Google Drive.");
-  await interaction.editReply({ content: `اكتملت معالجة **${results.length}** صورة.`, files: results.map((result) => new AttachmentBuilder(result.image, { name: result.outputName })) });
+  if (totalBytes > MAX_DISCORD_RESULT_BYTES) throw new Error("نتائج الصور أكبر من حد الإرسال في Discord. استخدم ZIP أو Google Drive للفصل الكبير.");
+  const attachments = results.map((result) => new AttachmentBuilder(result.image, { name: result.outputName }));
+  await sendPanel(channel, [
+    "## ✅ تم تبييض الفصل بنجاح",
+    `📷 تمت معالجة **${results.length}** صورة وإرفاق كل نتيجة باسمها الأصلي مع لاحقة **-clean**.`,
+    `📊 تقرير العملية: المدة **${duration(elapsed)}**، وضع التسليم **مرفقات Discord**.`,
+  ], { files: results.map((result) => result.outputName), attachments });
 }
 
-async function processSource(interaction: ButtonInteraction | ModalSubmitInteraction, source: SourceBatch, quality: CleaningQuality) {
-  await interaction.editReply("**جاري فحص المصدر…**");
-  const results = await cleanBatchInMemory({
-    images: source.images,
-    quality,
-    onProgress: async (current, total, name) => {
-      await interaction.editReply(current === total ? "**جاري تجهيز النتائج…**" : `**جاري تنظيف الصفحة ${current + 1}/${total}**\n\`${name}\``);
-    },
-  });
-  await deliverDiscordResult(interaction, source, results);
+async function runCleaningFlow(channel: TextChannel, userId: string, quality: CleaningQuality) {
+  let status: CleaningStatus | undefined;
+  const startedAt = Date.now();
+  try {
+    status = await CleaningStatus.create(channel, "جاري قراءة المصدر", "استلمت المصدر، وسأحدّث هذه اللوحة أثناء التحميل والتبييض.");
+    const sourceMessage = await awaitSourceMessage(channel, userId);
+    const source = await sourceFromMessage(sourceMessage);
+    await status.update("بدأ التبييض الآن", `تم العثور على **${source.images.length}** صورة في المصدر.`, { current: 0, total: source.images.length });
+    const results = await cleanBatchInMemory({
+      images: source.images,
+      quality,
+      onProgress: async (current, total, name) => {
+        const detail = current === total ? "اكتمل تبييض الصور؛ يجري تجهيز التسليم." : `تجري معالجة الصورة **${current + 1}** من **${total}**: **${name}**.`;
+        await status?.update("التبييض مستمر", detail, { current, total });
+      },
+    });
+    await status.update("تجهيز النتيجة", "اكتملت المعالجة؛ يجري رفع النتيجة إلى وجهتها.", { current: results.length, total: results.length });
+    await status.close();
+    status = undefined;
+    await sendFinalResult(channel, source, results, (Date.now() - startedAt) / 1000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "خطأ غير معروف.";
+    if (status) await status.update("✖️ تعذرت العملية", message, { error: true });
+    else await sendPanel(channel, ["## ✖️ تعذرت العملية", `ℹ️ ${message}`], { error: true });
+  }
 }
 
-function driveModal(quality: CleaningQuality) {
-  const input = new TextInputBuilder().setCustomId("link").setLabel("رابط Google Drive").setPlaceholder("https://drive.google.com/drive/folders/…").setRequired(true).setStyle(TextInputStyle.Paragraph);
-  return new ModalBuilder().setCustomId(`${DRIVE_MODAL_ID}:${quality}`).setTitle("معالجة من Google Drive").addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+async function startWizard(channel: TextChannel, userId: string) {
+  const session: ModeSession = { id: crypto.randomUUID().slice(0, 12), userId, channelId: channel.id, createdAt: Date.now() };
+  modeSessions.set(session.id, session);
+  await sendPanel(channel, modeSections());
+  await channel.send({ content: "⚙️ **اختر وضع المعالجة من الأزرار بالأسفل:**", components: [modeButtons(session)] });
+  setTimeout(() => modeSessions.delete(session.id), 15 * 60_000);
 }
 
-async function handleCleanCommand(interaction: ChatInputCommandInteraction) {
-  const quality = qualityFor(interaction.options.getString("quality"));
-  if (interaction.options.getString("quality")) {
-    await interaction.reply({ embeds: [studioEmbed(quality)], components: [sourceButtons(quality)], flags: EPHEMERAL });
+async function handleModeButton(interaction: ButtonInteraction) {
+  const [, rawSessionId, rawQuality] = interaction.customId.split(":");
+  const session = modeSessions.get(rawSessionId);
+  if (!session || session.channelId !== interaction.channelId || Date.now() - session.createdAt > 15 * 60_000) {
+    await interaction.reply({ content: "انتهى وقت هذه اللوحة. ابدأ `/clean` من جديد.", flags: EPHEMERAL });
     return;
   }
-  await interaction.reply({
-    embeds: [new EmbedBuilder().setColor(0xC8A45C).setTitle("Manga Bubble Cleaner · اختر المستوى").setDescription("اختر المستوى أولًا، ثم اختر مصدر صور الفصل. مستوى **حفظ التفاصيل** هو الافتراضي الموصى به.")],
-    components: [qualityButtons()],
-    flags: EPHEMERAL,
-  });
+  if (session.userId !== interaction.user.id) {
+    await interaction.reply({ content: "هذه اللوحة ليست لك. استخدم `/clean` لإنشاء لوحة خاصة بتدفقك.", flags: EPHEMERAL });
+    return;
+  }
+  const channel = interaction.channel;
+  if (!channel?.isTextBased() || !interaction.inGuild()) {
+    await interaction.reply({ content: "استخدم البوت داخل قناة نصية في خادم Discord.", flags: EPHEMERAL });
+    return;
+  }
+  modeSessions.delete(session.id);
+  const quality: CleaningQuality = rawQuality === "maximum-detail" ? "maximum-detail" : "balanced";
+  await interaction.update({ content: `✅ تم اختيار **${qualityLabel(quality)}**. أرسل المصدر في القناة التالية.` , components: [] });
+  await sendPanel(channel as TextChannel, sourceSections());
+  void runCleaningFlow(channel as TextChannel, interaction.user.id, quality);
 }
 
-async function handleAttachmentButton(interaction: ButtonInteraction, quality: CleaningQuality) {
-  await interaction.deferReply({ flags: EPHEMERAL });
-  try {
-    const source = await sourceFromDiscordAttachments(await collectDiscordAttachments(interaction));
-    await processSource(interaction, source, quality);
-  } catch (error) {
-    await interaction.editReply(`تعذرت المعالجة: ${error instanceof Error ? error.message : "خطأ غير معروف."}`);
+async function handleClean(interaction: ChatInputCommandInteraction) {
+  if (!interaction.inGuild() || !interaction.channel?.isTextBased()) {
+    await interaction.reply({ content: "استخدم `/clean` داخل قناة نصية في خادم Discord.", flags: EPHEMERAL });
+    return;
   }
+  await interaction.deferReply({ flags: EPHEMERAL });
+  await startWizard(interaction.channel as TextChannel, interaction.user.id);
+  await interaction.editReply("أرسلت لوحة بدء التبييض في هذه القناة.");
 }
 
-async function handleDriveModal(interaction: ModalSubmitInteraction, quality: CleaningQuality) {
-  await interaction.deferReply({ flags: EPHEMERAL });
-  try {
-    const driveSource = await readGoogleDriveSource(interaction.fields.getTextInputValue("link").trim());
-    await processSource(interaction, { ...driveSource, kind: "drive" }, quality);
-  } catch (error) {
-    await interaction.editReply(`تعذرت المعالجة: ${error instanceof Error ? error.message : "خطأ غير معروف."}`);
+async function handleHelp(interaction: ChatInputCommandInteraction) {
+  if (!interaction.inGuild() || !interaction.channel?.isTextBased()) {
+    await interaction.reply({ content: "استخدم `/help` داخل قناة نصية في خادم Discord.", flags: EPHEMERAL });
+    return;
   }
+  await interaction.deferReply({ flags: EPHEMERAL });
+  await sendPanel(interaction.channel as TextChannel, [
+    "# 📷 Manga Bubble Cleaner",
+    "بوت لتبييض نصوص فقاعات المانهوا مع الحفاظ على الرسم. استخدم `/clean` أو `!clean` للبدء.",
+    "🎮 **طريقة العمل**\nاختر سرعة عالية أو دقة كاملة، ثم أرسل صورًا مباشرة أو ZIP أو رابط Google Drive داخل القناة نفسها.",
+    "📦 **تسليم النتيجة**\nالمرفقات تعود صورًا، ZIP يعود ZIP، وGoogle Drive يعود برابط مجلد نتائج جديد. لا يحفظ الخادم الصور على قرصه.",
+  ]);
+  await interaction.editReply("أرسلت لوحة التعليمات في القناة.");
+}
+
+async function handlePrefixCommand(message: Message) {
+  if (message.author.bot || !message.inGuild() || !message.channel.isTextBased()) return;
+  const command = message.content.trim().toLowerCase();
+  if (["!clean", "!تبييض"].includes(command)) await startWizard(message.channel as TextChannel, message.author.id);
+  if (["!help", "!مساعدة", "!اوامر"].includes(command)) await sendPanel(message.channel as TextChannel, ["# 📷 Manga Bubble Cleaner", "استخدم `/clean` أو `!clean` للبدء، ثم اختر الوضع وأرسل صورًا أو ZIP أو رابط Google Drive."]);
 }
 
 async function registerCommands(client: Client) {
@@ -200,28 +334,22 @@ export function isDiscordBotEnabled(environment: NodeJS.ProcessEnv = process.env
 
 export function startDiscordBot() {
   if (!isDiscordBotEnabled()) { console.info("[discord] bot disabled: set DISCORD_ENABLED=true and DISCORD_BOT_TOKEN"); return; }
-  const token = process.env.DISCORD_BOT_TOKEN!.trim();
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
   client.once(Events.ClientReady, async (readyClient) => {
-    try { await registerCommands(client); console.info(`[discord] ready as ${readyClient.user.tag}`); }
-    catch (error) { console.error("[discord] command registration failed", error instanceof Error ? error.message : error); }
+    try {
+      await registerCommands(client);
+      await client.user?.setPresence({ activities: [{ name: "Manga Bubble Cleaner | /help", type: 3 }], status: "online" });
+      console.info(`[discord] ready as ${readyClient.user.tag}`);
+    } catch (error) { console.error("[discord] command registration failed", error instanceof Error ? error.message : error); }
   });
   client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "clean") await handleCleanCommand(interaction);
-      if (interaction.commandName === "help") await interaction.reply({ embeds: [studioEmbed("preserve-detail")], flags: EPHEMERAL });
+      if (interaction.commandName === "clean") await handleClean(interaction);
+      if (interaction.commandName === "help") await handleHelp(interaction);
       return;
     }
-    if (interaction.isButton()) {
-      if (interaction.customId.startsWith(`${QUALITY_BUTTON_ID}:`)) {
-        const quality = qualityFor(interaction.customId.split(":")[1]);
-        await interaction.update({ embeds: [studioEmbed(quality)], components: [sourceButtons(quality)] });
-      }
-      if (interaction.customId.startsWith(`${ATTACHMENTS_BUTTON_ID}:`)) await handleAttachmentButton(interaction, qualityFor(interaction.customId.split(":")[1]));
-      if (interaction.customId.startsWith(`${DRIVE_BUTTON_ID}:`)) await interaction.showModal(driveModal(qualityFor(interaction.customId.split(":")[1])));
-      return;
-    }
-    if (interaction.isModalSubmit() && interaction.customId.startsWith(`${DRIVE_MODAL_ID}:`)) await handleDriveModal(interaction, qualityFor(interaction.customId.split(":")[1]));
+    if (interaction.isButton() && interaction.customId.startsWith("mbc-mode:")) await handleModeButton(interaction);
   });
-  client.login(token).catch((error) => console.error("[discord] login failed", error instanceof Error ? error.message : error));
+  client.on(Events.MessageCreate, (message) => { void handlePrefixCommand(message); });
+  client.login(process.env.DISCORD_BOT_TOKEN!.trim()).catch((error) => console.error("[discord] login failed", error instanceof Error ? error.message : error));
 }
