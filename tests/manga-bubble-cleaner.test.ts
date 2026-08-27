@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { buildCleaningPrompt, decodeImageDataUrl, ensurePublicImageUrl, inpaintDetectedTextBoxes, manualRegionsForTile } from "../server/manga-bubble-cleaner";
+import { buildCleaningPrompt, decodeImageDataUrl, ensurePublicImageUrl, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile } from "../server/manga-bubble-cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("builds a high-detail prompt that preserves artwork and limits edits to dialogue text", () => {
@@ -73,5 +73,18 @@ describe("manga bubble cleanup safeguards", () => {
     const adjustment = [{ mode: "include" as const, points: [{ x: 0.2, y: 0.55 }, { x: 0.6, y: 0.65 }] }];
     expect(manualRegionsForTile(adjustment, 1000, 10_000, 0, 2400)).toEqual([]);
     expect(manualRegionsForTile(adjustment, 1000, 10_000, 4800, 2400)).toEqual([{ x: 200, y: 700, width: 400, height: 1000 }]);
+  });
+
+  it("uses whole-box repair for a smooth gradient but rejects a textured artwork ring", () => {
+    const smooth = Buffer.alloc(48 * 48 * 4, 255);
+    const textured = Buffer.alloc(48 * 48 * 4, 255);
+    for (let y = 0; y < 48; y += 1) for (let x = 0; x < 48; x += 1) {
+      const offset = (y * 48 + x) * 4;
+      smooth[offset] = 80 + y; smooth[offset + 1] = 35 + Math.floor(x / 12); smooth[offset + 2] = 45;
+      textured[offset] = x % 2 ? 230 : 15; textured[offset + 1] = 40; textured[offset + 2] = 55;
+    }
+    const region = { x: 18, y: 18, width: 12, height: 10 };
+    expect(hasSmoothBubbleBackdrop(smooth, 48, 48, region)).toBe(true);
+    expect(hasSmoothBubbleBackdrop(textured, 48, 48, region)).toBe(false);
   });
 });

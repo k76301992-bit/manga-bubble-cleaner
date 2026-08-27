@@ -107,8 +107,25 @@ function uniqueRegions(regions: BubbleTextRegion[]) {
 type Pixel = [number, number, number, number];
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const mix = (a: Pixel, b: Pixel, amount: number): Pixel => [a[0] + (b[0] - a[0]) * amount, a[1] + (b[1] - a[1]) * amount, a[2] + (b[2] - a[2]) * amount, 255];
+const colorDistance = (a: Pixel, b: Pixel) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
-/** Rebuilds only a text mask, sampling the bubble's local colour gradient around its text group. */
+/** Returns true only when a clean ring around the detected lettering behaves like a smooth bubble fill. */
+export function hasSmoothBubbleBackdrop(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
+  const read = (x: number, y: number): Pixel => { const offset = (y * width + x) * 4; return [source[offset], source[offset + 1], source[offset + 2], source[offset + 3]]; };
+  const x0 = clamp(region.x - 8, 2, width - 3); const y0 = clamp(region.y - 8, 2, height - 3);
+  const x1 = clamp(region.x + region.width + 8, x0 + 1, width - 3); const y1 = clamp(region.y + region.height + 8, y0 + 1, height - 3);
+  let sum = 0; let rough = 0; let samples = 0;
+  const inspect = (x: number, y: number) => {
+    const current = read(x, y); const right = read(x + 1, y); const below = read(x, y + 1);
+    const local = (colorDistance(current, right) + colorDistance(current, below)) / 2;
+    sum += local; if (local > 26) rough += 1; samples += 1;
+  };
+  for (let x = x0; x <= x1; x += 2) { inspect(x, y0); inspect(x, y1); }
+  for (let y = y0 + 2; y < y1; y += 2) { inspect(x0, y); inspect(x1, y); }
+  return samples > 8 && sum / samples < 13 && rough / samples < 0.12;
+}
+
+/** Rebuilds text layers from the bubble's local colour gradient without touching bubble outlines. */
 export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
   const output = Buffer.from(source);
   const read = (x: number, y: number): Pixel => { const offset = (y * width + x) * 4; return [source[offset], source[offset + 1], source[offset + 2], source[offset + 3]]; };
@@ -119,17 +136,25 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     return [samples.reduce((sum, color) => sum + color[0], 0) / samples.length, samples.reduce((sum, color) => sum + color[1], 0) / samples.length, samples.reduce((sum, color) => sum + color[2], 0) / samples.length, 255];
   };
   for (const region of uniqueRegions(regions)) {
-    const x0 = clamp(region.x - 4, 6, width - 7); const y0 = clamp(region.y - 4, 6, height - 7);
-    const x1 = clamp(region.x + region.width + 4, x0 + 1, width - 7); const y1 = clamp(region.y + region.height + 4, y0 + 1, height - 7);
+    const smoothBackdrop = hasSmoothBubbleBackdrop(source, width, height, region);
+    const layerPadding = smoothBackdrop ? clamp(Math.round(Math.min(region.width, region.height) * 0.08), 8, 16) : 4;
+    const x0 = clamp(region.x - layerPadding, 6, width - 7); const y0 = clamp(region.y - layerPadding, 6, height - 7);
+    const x1 = clamp(region.x + region.width + layerPadding, x0 + 1, width - 7); const y1 = clamp(region.y + region.height + layerPadding, y0 + 1, height - 7);
+    const backdropAt = (x: number, y: number) => {
+      const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
+      const vertical = mix(averageAt(x, y0 - 4, "x"), averageAt(x, y1 + 4, "x"), (y - y0) / Math.max(1, y1 - y0));
+      return mix(horizontal, vertical, 0.35);
+    };
+    if (smoothBackdrop) {
+      for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) write(x, y, backdropAt(x, y));
+      continue;
+    }
     const boxWidth = x1 - x0 + 1; const boxHeight = y1 - y0 + 1;
     const mask = new Uint8Array(boxWidth * boxHeight);
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
-      const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
-      const vertical = mix(averageAt(x, y0 - 4, "x"), averageAt(x, y1 + 4, "x"), (y - y0) / Math.max(1, y1 - y0));
-      const backdrop = mix(horizontal, vertical, 0.35);
+      const backdrop = backdropAt(x, y);
       const current = read(x, y);
-      const contrast = Math.hypot(current[0] - backdrop[0], current[1] - backdrop[1], current[2] - backdrop[2]);
-      if (contrast > 28) mask[(y - y0) * boxWidth + x - x0] = 1;
+      if (colorDistance(current, backdrop) > 20) mask[(y - y0) * boxWidth + x - x0] = 1;
     }
     const expanded = new Uint8Array(mask);
     for (let y = 2; y < boxHeight - 2; y += 1) for (let x = 2; x < boxWidth - 2; x += 1) {
@@ -138,9 +163,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     }
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
       if (!expanded[(y - y0) * boxWidth + x - x0]) continue;
-      const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
-      const vertical = mix(averageAt(x, y0 - 4, "x"), averageAt(x, y1 + 4, "x"), (y - y0) / Math.max(1, y1 - y0));
-      write(x, y, mix(horizontal, vertical, 0.35));
+      write(x, y, backdropAt(x, y));
     }
   }
   return output;
