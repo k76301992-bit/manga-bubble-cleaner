@@ -293,7 +293,7 @@ async function inpaintWithTrainedModel(source: Buffer, width: number, height: nu
     const right = clamp(region.x + region.width + padding, left + 1, width); const bottom = clamp(region.y + region.height + padding, top + 1, height);
     const cropWidth = right - left; const cropHeight = bottom - top; const cropMask = Buffer.alloc(cropWidth * cropHeight);
     let hasMask = false;
-    for (let y = 0; y < cropHeight; y += 1) for (let x = 0; x < cropWidth; x += 1) { const value = globalMask[(top + y) * width + left + x]; cropMask[y * cropWidth + x] = value; hasMask ||= value > 0; }
+    for (let y = 0; y < cropHeight; y += 1) { cropMask.set(globalMask.subarray((top + y) * width + left, (top + y) * width + right), y * cropWidth); hasMask ||= cropMask.subarray(y * cropWidth, (y + 1) * cropWidth).some((value) => value > 0); }
     if (!hasMask) continue;
     const cropImage = await sharp(cropRaw(output, width, height, left, top, cropWidth, cropHeight), { raw: { width: cropWidth, height: cropHeight, channels: 4 } }).png().toBuffer();
     const maskImage = await sharp(cropMask, { raw: { width: cropWidth, height: cropHeight, channels: 1 } }).png().toBuffer();
