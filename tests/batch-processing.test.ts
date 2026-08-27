@@ -18,9 +18,9 @@ describe("batch processing sources", () => {
     expect(images.map((image) => image.name)).toEqual(["page-2.png", "page-10.webp"]);
   });
 
-  it("allows a ten-page chapter while retaining a total-memory limit", () => {
-    const pages = Array.from({ length: 10 }, (_, index) => ({ name: `page-${index + 1}.png`, mimeType: "image/png", image: Buffer.from([index]) }));
-    expect(MAX_IMAGES_PER_BATCH).toBe(10);
+  it("allows a twelve-page chapter while retaining a total-memory limit", () => {
+    const pages = Array.from({ length: 12 }, (_, index) => ({ name: `page-${index + 1}.png`, mimeType: "image/png", image: Buffer.from([index]) }));
+    expect(MAX_IMAGES_PER_BATCH).toBe(12);
     expect(() => validateBatchImages(pages)).not.toThrow();
   });
 

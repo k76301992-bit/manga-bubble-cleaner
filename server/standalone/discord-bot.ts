@@ -46,7 +46,7 @@ export function validateDiscordImageAttachment(attachment: DiscordAttachmentInpu
 function validateDiscordZipAttachment(attachment: DiscordAttachmentInput) {
   if (!isDiscordCdn(attachment.url)) return "يجب أن يكون ملف ZIP مرفقًا من Discord نفسه عبر HTTPS.";
   if (!attachment.name.toLowerCase().endsWith(".zip")) return "ارفع ملف ZIP يحتوي صور PNG أو JPG أو WebP.";
-  if (!attachment.size || attachment.size > MAX_ZIP_BYTES) return "يجب ألا يتجاوز ملف ZIP 25 ميغابايت.";
+  if (!attachment.size || attachment.size > MAX_ZIP_BYTES) return "يجب ألا يتجاوز ملف ZIP 50 ميغابايت.";
   return undefined;
 }
 
@@ -85,7 +85,7 @@ function modeSections() {
   return [
     "## ⚙️ اختر وضع التبييض",
     "### ⚡ سرعة عالية — موصى به\nيكشف الفقاعات البيضاء والرمادية محليًا وبشكل محافظ؛ لا ينتظر خدمة كشف خارجية، لذلك يناسب الفصول المعتادة.",
-    "### ✅ دقة كاملة\nيضيف كشفًا خارجيًا للفقاعات الصعبة والملونة عند الحاجة، ثم يرمم مناطق النص بقناع عبر نموذج Anime-Manga Big-LaMa المقيم. إذا تعذر الكشف في شريحة، يكمل البوت الصفحة من دون إيقاف الدفعة.",
+    "### ✅ دقة كاملة — وضع هجين\nيبقي الفقاعات البيضاء المتجانسة على ترميم محلي سريع، ويستخدم Anime-Manga Big-LaMa للفقاعات الداكنة والملونة عند توفر قناع موثوق. إذا تعذر الكشف في شريحة، يكمل البوت الصفحة من دون إيقاف الدفعة.",
   ];
 }
 
@@ -94,7 +94,7 @@ function sourceSections() {
     "## 📂 خطوة إرفاق صور الفصل",
     "## توجد ثلاث طرق لإرسال صور فصلك.",
     `📷 **الطريقة الأولى:** أرفق حتى **${MAX_IMAGES_PER_BATCH}** صور مباشرة في رسالة واحدة، واحفظ ترتيب الصفحات في أسمائها.`,
-    "🗜️ **الطريقة الثانية:** أرسل ملف ZIP واحدًا يحتوي صور الفصل مرتبة بأسمائها؛ سيعود ZIP بالنتائج.",
+    `🗜️ **الطريقة الثانية:** أرسل ملف ZIP واحدًا حتى **${Math.round(MAX_ZIP_BYTES / 1024 / 1024)}MB** يحتوي صور الفصل مرتبة بأسمائها؛ سيعود ZIP بالنتائج، أو رابط Google Drive إذا تجاوزت النتيجة حد مرفقات Discord.`,
     "🗂️ **الطريقة الثالثة:** أرسل رابط Google Drive لصورة أو ZIP أو مجلد مشترك مع حساب الخدمة؛ سيُنشأ مجلد نتائج جديد ويُعاد رابطه.",
   ];
 }
@@ -216,6 +216,16 @@ async function sendFinalResult(channel: TextChannel, source: SourceBatch, result
   if (source.kind === "zip") {
     const archive = await createResultZip(results);
     const fileName = `${source.sourceName}-cleaned.zip`;
+    if (archive.length > MAX_DISCORD_RESULT_BYTES) {
+      const folder = await createGoogleDriveResultFolder({ sourceName: source.sourceName, results });
+      await sendPanel(channel, [
+        "## ✅ تم تبييض الفصل بنجاح",
+        `📷 تمت معالجة **${results.length}** صورة، لكن حجم ZIP الناتج يتجاوز حد مرفقات Discord.`,
+        `📊 تقرير العملية: المدة **${duration(elapsed)}**، وضع التسليم **Google Drive**.`,
+        `🔗 رابط مجلد النتائج: ${folder.url}`,
+      ]);
+      return;
+    }
     await sendPanel(channel, [
       "## ✅ تم تبييض الفصل بنجاح",
       `📷 تمت معالجة **${results.length}** صورة وإرفاق ملف **${fileName}**.`,
@@ -224,7 +234,16 @@ async function sendFinalResult(channel: TextChannel, source: SourceBatch, result
     return;
   }
   const totalBytes = results.reduce((total, result) => total + result.image.length, 0);
-  if (totalBytes > MAX_DISCORD_RESULT_BYTES) throw new Error("نتائج الصور أكبر من حد الإرسال في Discord. استخدم ZIP أو Google Drive للفصل الكبير.");
+  if (totalBytes > MAX_DISCORD_RESULT_BYTES) {
+    const folder = await createGoogleDriveResultFolder({ sourceName: source.sourceName, results });
+    await sendPanel(channel, [
+      "## ✅ تم تبييض الفصل بنجاح",
+      `📷 تمت معالجة **${results.length}** صورة، لكن حجم المرفقات يتجاوز حد Discord.`,
+      `📊 تقرير العملية: المدة **${duration(elapsed)}**، وضع التسليم **Google Drive**.`,
+      `🔗 رابط مجلد النتائج: ${folder.url}`,
+    ]);
+    return;
+  }
   const attachments = results.map((result) => new AttachmentBuilder(result.image, { name: result.outputName }));
   await sendPanel(channel, [
     "## ✅ تم تبييض الفصل بنجاح",
@@ -240,7 +259,7 @@ async function runCleaningFlow(channel: TextChannel, userId: string, quality: Cl
     status = await CleaningStatus.create(channel, "جاري قراءة المصدر", "استلمت المصدر، وسأحدّث هذه اللوحة أثناء التحميل والتبييض.");
     const sourceMessage = await awaitSourceMessage(channel, userId);
     const source = await sourceFromMessage(sourceMessage);
-    await status.update("بدأ التبييض الآن", `تم العثور على **${source.images.length}** صورة في المصدر.`, { current: 0, total: source.images.length });
+    await status.update("بدأ التبييض الآن", `تم العثور على **${source.images.length}** صورة. وضع الترميم: **${quality === "balanced" ? "محلي سريع" : "هجين"}**.`, { current: 0, total: source.images.length });
     const results = await cleanBatchInMemory({
       images: source.images,
       quality,

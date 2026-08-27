@@ -200,6 +200,19 @@ function inferLightBubbleFill(source: Buffer, width: number, height: number, reg
   return [median(light.map((color) => color[0])), median(light.map((color) => color[1])), median(light.map((color) => color[2])), 255];
 }
 
+/**
+ * The learned model is helpful where a simple fill would damage a coloured or
+ * dark bubble. Neutral white dialogue balloons are deliberately kept on the
+ * local path: it is faster and does not leave the faint learned-model haze
+ * observed on otherwise flat white paper.
+ */
+export function shouldUseLocalBubbleRepair(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
+  const fill = inferLightBubbleFill(source, width, height, region);
+  if (!fill) return false;
+  const chroma = Math.max(fill[0], fill[1], fill[2]) - Math.min(fill[0], fill[1], fill[2]);
+  return brightness(fill) >= 205 && chroma <= 32;
+}
+
 export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
   const output = Buffer.from(source);
   const read = (x: number, y: number): Pixel => { const o = (y * width + x) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
@@ -342,8 +355,11 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const detected = uniqueRegions([...local, ...remote]); detectedRegions += detected.length;
     const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)]);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
-    const trained = profile.useTrainedInpainting && regions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, regions) : undefined;
-    const repairedRaw = trained?.repairedRegions ? trained.output : inpaintDetectedTextBoxes(tileData, width, currentHeight, regions);
+    const localRegions = profile.useTrainedInpainting ? regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : regions;
+    const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
+    const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions) : undefined;
+    const trainedOutput = trained?.repairedRegions ? trained.output : tileData;
+    const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions);
     trainedInpaintRegions += trained?.repairedRegions ?? 0;
     const sourceStart = (coreTop - top) * rowBytes;
     repairedRaw.copy(output, coreTop * rowBytes, sourceStart, sourceStart + coreHeight * rowBytes);

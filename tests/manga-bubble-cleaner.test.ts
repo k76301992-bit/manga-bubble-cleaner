@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { cleaningProfileFor, detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions } from "../server/standalone/cleaner";
+import { cleaningProfileFor, detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("normalizes incomplete local settings without weakening the quality default", () => {
@@ -63,6 +63,15 @@ describe("manga bubble cleanup safeguards", () => {
     expect(cleaningProfileFor("balanced").tileHeight).toBeGreaterThan(cleaningProfileFor("maximum-detail").tileHeight);
     expect(cleaningProfileFor("balanced").useRemoteWhenLocalMisses).toBe(false);
     expect(cleaningProfileFor("maximum-detail").useRemoteWhenLocalMisses).toBe(true);
+  });
+
+  it("keeps neutral white bubbles on the local repair path and sends coloured bubbles to the trained path", () => {
+    const white = Buffer.alloc(80 * 80 * 4, 255);
+    const red = Buffer.alloc(80 * 80 * 4, 255);
+    for (let pixel = 0; pixel < 80 * 80; pixel += 1) { red[pixel * 4] = 130; red[pixel * 4 + 1] = 28; red[pixel * 4 + 2] = 38; }
+    const region = { x: 22, y: 24, width: 28, height: 16 };
+    expect(shouldUseLocalBubbleRepair(white, 80, 80, region)).toBe(true);
+    expect(shouldUseLocalBubbleRepair(red, 80, 80, region)).toBe(false);
   });
 
   it("maps a manual include region to its intersecting tile only", () => {

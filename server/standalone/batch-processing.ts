@@ -5,9 +5,10 @@ import { MAX_IMAGE_BYTES, processImageInMemory, supportedImageTypes } from "./pr
 
 export type BatchImage = { name: string; mimeType: string; image: Buffer };
 export type CleanedBatchImage = { sourceName: string; outputName: string; image: Buffer };
-export const MAX_IMAGES_PER_BATCH = 10;
-export const MAX_ZIP_BYTES = 25 * 1024 * 1024;
-const MAX_UNCOMPRESSED_ZIP_BYTES = 100 * 1024 * 1024;
+export const MAX_IMAGES_PER_BATCH = 12;
+export const MAX_ZIP_BYTES = 50 * 1024 * 1024;
+const MAX_UNCOMPRESSED_ZIP_BYTES = 150 * 1024 * 1024;
+const MAX_BATCH_INPUT_BYTES = 55 * 1024 * 1024;
 
 function releaseUnusedPageBuffers() {
   const collect = (globalThis as typeof globalThis & { gc?: () => void }).gc;
@@ -37,11 +38,11 @@ export function validateBatchImages(images: BatchImage[]) {
     if (!item.image.length || item.image.length > MAX_IMAGE_BYTES) throw new Error(`الصورة ${item.name} تتجاوز حد 20 ميغابايت.`);
     total += item.image.length;
   }
-  if (total > 30 * 1024 * 1024) throw new Error("إجمالي الصور يتجاوز حد الذاكرة الآمن للعملية الواحدة (30 ميغابايت).");
+  if (total > MAX_BATCH_INPUT_BYTES) throw new Error("إجمالي الصور يتجاوز حد الذاكرة الآمن للعملية الواحدة (55 ميغابايت).");
 }
 
 export async function extractImagesFromZip(zipBuffer: Buffer): Promise<BatchImage[]> {
-  if (!zipBuffer.length || zipBuffer.length > MAX_ZIP_BYTES) throw new Error("ملف ZIP يتجاوز حد 25 ميغابايت.");
+  if (!zipBuffer.length || zipBuffer.length > MAX_ZIP_BYTES) throw new Error("ملف ZIP يتجاوز حد 50 ميغابايت.");
   const archive = await JSZip.loadAsync(zipBuffer, { checkCRC32: false, createFolders: false });
   const entries = Object.values(archive.files).filter((entry) => !entry.dir && mimeTypeForFileName(entry.name));
   if (!entries.length) throw new Error("لا يحتوي ZIP على صور PNG أو JPG أو WebP.");

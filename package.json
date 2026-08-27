@@ -5,7 +5,7 @@
   "main": "expo-router/entry",
   "scripts": {
     "dev": "concurrently -k \"pnpm dev:inference\" \"pnpm dev:server\" \"pnpm dev:metro\"",
-    "dev:inference": "INFERENCE_HOST=127.0.0.1 INFERENCE_PORT=${INFERENCE_PORT:-8090} python3 server/inference-service/app.py",
+    "dev:inference": "sh scripts/start-inference-dev.sh",
     "dev:server": "cross-env NODE_ENV=development node --expose-gc ./node_modules/tsx/dist/cli.mjs watch server/standalone/index.ts",
     "dev:metro": "cross-env EXPO_USE_METRO_WORKSPACE_ROOT=1 npx expo start --max-workers 1 --port ${EXPO_PORT:-8081}",
     "build": "esbuild server/standalone/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist --out-extension:.js=.mjs",
