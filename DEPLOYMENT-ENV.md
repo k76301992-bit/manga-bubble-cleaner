@@ -13,7 +13,8 @@
 | `ALLOWED_ORIGIN` | الخادم فقط | لواجهة ويب | أصل واجهة الويب المسموح به، مثل `https://studio.example.com`. |
 | `SERVICE_API_KEY` | الخادم فقط | لا | حماية اختيارية للاتصالات الخادمية، مثل بوت Discord. |
 | `DISCORD_BOT_TOKEN` | الخادم فقط | لتشغيل البوت | رمز البوت من بوابة مطوري Discord. لا يوضع في التطبيق أو GitHub. |
-| `DISCORD_ENABLED` | الخادم فقط | لتشغيل البوت | عيّنه إلى `true` فقط بعد دعوة البوت واختبار بيئة Railway. |
+| `DISCORD_ENABLED` | الخادم فقط | لتشغيل البوت | عيّنه إلى `true` لتشغيل البوت العام بعد دعوته إلى الخوادم المطلوبة. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | الخادم فقط | لمسار Google Drive | محتوى JSON الكامل لمفتاح حساب خدمة Google بعد تفعيل Drive API؛ لا تستخدم مفتاح API عاديًا. |
 | `EXPO_PUBLIC_API_BASE_URL` | بيئة بناء Expo فقط | نعم للإصدار المنشور | رابط HTTPS العام لخادم التبييض المملوك لك. |
 
 ## مثال لخادم محلي
@@ -32,3 +33,5 @@ EXPO_PUBLIC_API_BASE_URL=https://cleaner.example.com
 ```
 
 > `EXPO_PUBLIC_API_BASE_URL` عنوان عام وليس سرًا؛ أما كل المتغيرات الأخرى فتبقى في بيئة الخادم. إذا فُعّل `SERVICE_API_KEY`، يجب أن يرسله بوت Discord من خادمه الخاص. لا تضمّنه في IPA.
+
+> لكي يلتقط البوت رسالة المرفقات أو ZIP التالية بعد اختيار المستخدم لها من اللوحة، فعّل **Message Content Intent** في صفحة Bot ضمن بوابة مطوري Discord، وأضف صلاحية **Read Message History** عند إنشاء رابط الدعوة.
