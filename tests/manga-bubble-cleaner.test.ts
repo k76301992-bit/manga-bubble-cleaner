@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { cleanImageInMemory, cleaningProfileFor, detectFallbackDarkTextRegions, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
+import { cleanImageInMemory, cleaningProfileFor, detectFallbackDarkTextRegions, hasLikelyClosedBubbleOutline, hasNeutralLightBubbleInterior, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, mergeAdjacentTextLines, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("normalizes incomplete local settings without weakening the quality default", () => {
@@ -63,6 +63,7 @@ describe("manga bubble cleanup safeguards", () => {
     expect(cleaningProfileFor("balanced").tileHeight).toBeGreaterThan(cleaningProfileFor("maximum-detail").tileHeight);
     expect(cleaningProfileFor("balanced").useRemoteWhenLocalMisses).toBe(false);
     expect(cleaningProfileFor("maximum-detail").useRemoteWhenLocalMisses).toBe(true);
+    expect(cleaningProfileFor("maximum-detail").maxRegionsPerTile).toBeGreaterThan(cleaningProfileFor("balanced").maxRegionsPerTile);
   });
 
   it("returns a PNG with exactly the input dimensions", async () => {
@@ -112,6 +113,36 @@ describe("manga bubble cleanup safeguards", () => {
     const region = { x: 18, y: 18, width: 12, height: 10 };
     expect(hasSmoothBubbleBackdrop(smooth, 48, 48, region)).toBe(true);
     expect(hasSmoothBubbleBackdrop(textured, 48, 48, region)).toBe(false);
+  });
+
+  it("requires evidence of an enclosing outline before local cleanup touches a light scene", () => {
+    const width = 160; const height = 120; const raw = Buffer.alloc(width * height * 4, 248);
+    const region = { x: 55, y: 45, width: 50, height: 24 };
+    expect(hasLikelyClosedBubbleOutline(raw, width, height, region)).toBe(false);
+    for (let x = 30; x <= 130; x += 1) for (const y of [24, 92]) { const offset = (y * width + x) * 4; raw[offset] = raw[offset + 1] = raw[offset + 2] = 12; }
+    for (let y = 24; y <= 92; y += 1) for (const x of [30, 130]) { const offset = (y * width + x) * 4; raw[offset] = raw[offset + 1] = raw[offset + 2] = 12; }
+    expect(hasLikelyClosedBubbleOutline(raw, width, height, region)).toBe(true);
+  });
+
+  it("distinguishes a light bubble interior from light lettering on a dark interface", () => {
+    const width = 120; const height = 80; const region = { x: 20, y: 20, width: 80, height: 40 };
+    const whiteBubble = Buffer.alloc(width * height * 4, 248);
+    expect(hasNeutralLightBubbleInterior(whiteBubble, width, height, region)).toBe(true);
+    const darkInterface = Buffer.alloc(width * height * 4, 18);
+    for (let y = 29; y < 51; y += 1) for (let x = 40; x < 80; x += 1) { const offset = (y * width + x) * 4; darkInterface[offset] = darkInterface[offset + 1] = darkInterface[offset + 2] = 250; darkInterface[offset + 3] = 255; }
+    expect(hasNeutralLightBubbleInterior(darkInterface, width, height, region)).toBe(false);
+  });
+
+  it("merges adjacent aligned dialogue lines before bubble validation", () => {
+    expect(mergeAdjacentTextLines([
+      { x: 45, y: 30, width: 75, height: 15 },
+      { x: 50, y: 55, width: 67, height: 16 },
+      { x: 52, y: 81, width: 58, height: 15 },
+      { x: 150, y: 35, width: 40, height: 15 },
+    ])).toEqual([
+      { x: 45, y: 30, width: 75, height: 66 },
+      { x: 150, y: 35, width: 40, height: 15 },
+    ]);
   });
 
   it("finds a connected dark dialogue line inside a smooth low-saturation bubble when Qwen is unavailable", async () => {

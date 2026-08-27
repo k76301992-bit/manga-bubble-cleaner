@@ -46,6 +46,11 @@ function mimeTypeForAttachment(attachment: DiscordAttachmentInput) {
   return declared && ["image/png", "image/jpeg", "image/webp"].includes(declared) ? declared : mimeTypeForFileName(attachment.name);
 }
 
+export function isDiscordZipAttachment(attachment: DiscordAttachmentInput) {
+  const declared = attachment.contentType?.split(";")[0].toLowerCase();
+  return attachment.name.toLowerCase().endsWith(".zip") || declared === "application/zip" || declared === "application/x-zip-compressed";
+}
+
 export function validateDiscordImageAttachment(attachment: DiscordAttachmentInput) {
   if (!isDiscordCdn(attachment.url)) return "يجب أن يكون الملف مرفقًا من Discord نفسه عبر HTTPS.";
   if (!mimeTypeForAttachment(attachment)) return "ارفع صور PNG أو JPG أو WebP فقط.";
@@ -53,9 +58,9 @@ export function validateDiscordImageAttachment(attachment: DiscordAttachmentInpu
   return undefined;
 }
 
-function validateDiscordZipAttachment(attachment: DiscordAttachmentInput) {
+export function validateDiscordZipAttachment(attachment: DiscordAttachmentInput) {
   if (!isDiscordCdn(attachment.url)) return "يجب أن يكون ملف ZIP مرفقًا من Discord نفسه عبر HTTPS.";
-  if (!attachment.name.toLowerCase().endsWith(".zip")) return "ارفع ملف ZIP يحتوي صور PNG أو JPG أو WebP.";
+  if (!isDiscordZipAttachment(attachment)) return "ارفع ملف ZIP يحتوي صور PNG أو JPG أو WebP.";
   if (!attachment.size || attachment.size > MAX_ZIP_BYTES) return "يجب ألا يتجاوز ملف ZIP 50 ميغابايت.";
   return undefined;
 }
@@ -101,6 +106,8 @@ function modeSections() {
 
 function sourceSections() {
   return [
+    "## ⏳ في انتظار المصدر — لم تبدأ المعالجة بعد",
+    "أرسل الصورة أو ZIP الآن في القناة؛ ستظهر لوحة التقدم فقط عند وصول مصدر صالح.",
     "## 📂 خطوة إرفاق صور الفصل",
     "## توجد ثلاث طرق لإرسال صور فصلك.",
     `📷 **الطريقة الأولى:** أرفق حتى **${MAX_IMAGES_PER_BATCH}** صور مباشرة في رسالة واحدة، واحفظ ترتيب الصفحات في أسمائها.`,
@@ -181,7 +188,7 @@ async function fetchAttachmentBytes(attachment: DiscordAttachmentInput) {
 
 export async function sourceFromDiscordAttachments(attachments: DiscordAttachmentInput[]): Promise<SourceBatch> {
   if (!attachments.length) throw new Error("لم ترسل أي مرفق.");
-  const zipFiles = attachments.filter((attachment) => attachment.name.toLowerCase().endsWith(".zip"));
+  const zipFiles = attachments.filter(isDiscordZipAttachment);
   if (zipFiles.length) {
     if (attachments.length !== 1) throw new Error("أرسل ZIP وحده، أو أرسل صورًا مباشرة فقط؛ لا تخلط بينهما.");
     const invalid = validateDiscordZipAttachment(zipFiles[0]);
@@ -262,12 +269,12 @@ async function sendFinalResult(channel: TextChannel, source: SourceBatch, result
   ], { files: results.map((result) => result.outputName), attachments });
 }
 
-async function runCleaningFlow(channel: TextChannel, userId: string, quality: CleaningQuality) {
+async function runCleaningFlow(channel: TextChannel, userId: string, quality: CleaningQuality, sourceMessagePromise: Promise<Message>) {
   let status: CleaningStatus | undefined;
   const startedAt = Date.now();
   try {
-    status = await CleaningStatus.create(channel, "جاري قراءة المصدر", "استلمت المصدر، وسأحدّث هذه اللوحة أثناء التحميل والتبييض.");
-    const sourceMessage = await awaitSourceMessage(channel, userId);
+    const sourceMessage = await sourceMessagePromise;
+    status = await CleaningStatus.create(channel, "جاري قراءة المصدر", "استلمت المصدر؛ يجري التحقق من الصور أو محتوى ZIP قبل التبييض.");
     const source = await sourceFromMessage(sourceMessage);
     await status.update("بدأ التبييض الآن", `تم العثور على **${source.images.length}** صورة. وضع الترميم: **${quality === "balanced" ? "محلي سريع" : "هجين"}**.`, { current: 0, total: source.images.length });
     const results = await cleanBatchInMemory({
@@ -315,9 +322,11 @@ async function handleModeButton(interaction: ButtonInteraction) {
   }
   modeSessions.delete(session.id);
   const quality: CleaningQuality = rawQuality === "maximum-detail" ? "maximum-detail" : "balanced";
+  // Attach the collector first so a ZIP sent immediately after tapping the mode is not lost.
+  const sourceMessagePromise = awaitSourceMessage(channel as TextChannel, interaction.user.id);
   await interaction.update({ content: `✅ تم اختيار **${qualityLabel(quality)}**. أرسل المصدر في القناة التالية.` , components: [] });
   await sendPanel(channel as TextChannel, sourceSections());
-  void runCleaningFlow(channel as TextChannel, interaction.user.id, quality);
+  void runCleaningFlow(channel as TextChannel, interaction.user.id, quality, sourceMessagePromise);
 }
 
 async function handleClean(interaction: ChatInputCommandInteraction) {

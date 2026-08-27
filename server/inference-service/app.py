@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
+import cv2
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -25,12 +26,17 @@ from pydantic import BaseModel
 MODEL_URL = "https://github.com/Sanster/models/releases/download/AnimeMangaInpainting/anime-manga-big-lama.pt"
 MODEL_MD5 = "29f284f36a0a510bcacf39ecf4c4d54f"
 MODEL_PATH = Path(os.environ.get("ANIME_LAMA_MODEL_PATH", "/home/ubuntu/.cache/torch/hub/checkpoints/anime-manga-big-lama.pt"))
+TEXT_DETECTOR_PATH = Path(os.environ.get("COMIC_TEXT_DETECTOR_PATH", str(Path(__file__).resolve().parent / "models" / "comictextdetector.pt.onnx")))
 MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
 
 
 class InpaintPayload(BaseModel):
+  image: str
+  mask: str
+
+
+class TextDetectionPayload(BaseModel):
     image: str
-    mask: str
 
 
 class AnimeLamaEngine:
@@ -95,7 +101,69 @@ class AnimeLamaEngine:
         return buffer.getvalue(), round((time.monotonic() - started) * 1000)
 
 
+class ComicTextDetector:
+    def __init__(self):
+        self.net = None
+        self.lock = threading.Lock()
+        self.load_time_ms = 0
+
+    def load(self) -> None:
+        if self.net is not None:
+            return
+        if not TEXT_DETECTOR_PATH.exists():
+            raise RuntimeError("Comic text detector model is unavailable")
+        started = time.monotonic()
+        self.net = cv2.dnn.readNetFromONNX(str(TEXT_DETECTOR_PATH))
+        self.load_time_ms = round((time.monotonic() - started) * 1000)
+        print(f"[inference] Comic text detector ready in {self.load_time_ms}ms")
+
+    @staticmethod
+    def _letterbox(image: np.ndarray) -> tuple[np.ndarray, float]:
+        height, width = image.shape[:2]
+        ratio = min(1024 / width, 1024 / height)
+        resized_width, resized_height = round(width * ratio), round(height * ratio)
+        canvas = np.full((1024, 1024, 3), 114, dtype=np.uint8)
+        canvas[:resized_height, :resized_width] = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+        return canvas, ratio
+
+    def detect(self, image_bytes: bytes) -> tuple[list[dict[str, int | float]], int]:
+        if not image_bytes or len(image_bytes) > MAX_PAYLOAD_BYTES:
+            raise ValueError("Input image exceeds the private text detection limit")
+        self.load()
+        source = np.asarray(Image.open(io.BytesIO(image_bytes)).convert("RGB"))[:, :, ::-1].copy()
+        image, ratio = self._letterbox(source)
+        blob = cv2.dnn.blobFromImage(image, scalefactor=1 / 255.0, size=(1024, 1024), swapRB=True, crop=False)
+        started = time.monotonic()
+        with self.lock:
+            self.net.setInput(blob)
+            blocks = np.asarray(self.net.forward(["blk"]), dtype=np.float32).reshape(-1, 7)
+        candidates: list[tuple[list[int], float, int]] = []
+        for row in blocks:
+            center_x, center_y, box_width, box_height, objectness = row[:5]
+            classes = row[5:]
+            if not len(classes):
+                continue
+            class_id = int(np.argmax(classes))
+            confidence = float(objectness * classes[class_id])
+            if confidence < 0.40 or box_width < 5 or box_height < 5:
+                continue
+            candidates.append(([round(center_x - box_width / 2), round(center_y - box_height / 2), round(box_width), round(box_height)], confidence, class_id))
+        if not candidates:
+            return [], round((time.monotonic() - started) * 1000)
+        indices = cv2.dnn.NMSBoxes([box for box, _, _ in candidates], [score for _, score, _ in candidates], score_threshold=0.40, nms_threshold=0.35)
+        regions: list[dict[str, int | float]] = []
+        for index in np.asarray(indices).reshape(-1):
+            left, top, box_width, box_height = candidates[int(index)][0]
+            x0 = max(0, min(source.shape[1] - 1, round(left / ratio)))
+            y0 = max(0, min(source.shape[0] - 1, round(top / ratio)))
+            x1 = max(x0 + 1, min(source.shape[1], round((left + box_width) / ratio)))
+            y1 = max(y0 + 1, min(source.shape[0], round((top + box_height) / ratio)))
+            regions.append({"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0, "confidence": round(candidates[int(index)][1], 3), "class": candidates[int(index)][2]})
+        return sorted(regions, key=lambda region: (int(region["y"]), int(region["x"]))), round((time.monotonic() - started) * 1000)
+
+
 engine = AnimeLamaEngine()
+text_detector = ComicTextDetector()
 
 
 @asynccontextmanager
@@ -109,7 +177,7 @@ app = FastAPI(title="Manga Bubble Cleaner Inference", docs_url=None, redoc_url=N
 
 @app.get("/health")
 def health():
-    return {"ok": engine.model is not None, "model": "anime-manga-big-lama", "loadTimeMs": engine.load_time_ms, "imagesPersisted": False}
+    return {"ok": engine.model is not None, "model": "anime-manga-big-lama", "loadTimeMs": engine.load_time_ms, "textDetectorReady": text_detector.net is not None, "imagesPersisted": False}
 
 
 @app.post("/v1/inpaint")
@@ -124,6 +192,19 @@ def inpaint(payload: InpaintPayload):
     except Exception as error:
         print(f"[inference] request failed: {error}")
         raise HTTPException(status_code=503, detail="Private inpainting service is temporarily unavailable") from error
+
+
+@app.post("/v1/detect-text")
+def detect_text(payload: TextDetectionPayload):
+    try:
+        image_bytes = base64.b64decode(payload.image, validate=True)
+        regions, elapsed_ms = text_detector.detect(image_bytes)
+        return {"regions": regions, "elapsedMs": elapsed_ms}
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        print(f"[inference] text detection failed: {error}")
+        raise HTTPException(status_code=503, detail="Private text detection service is temporarily unavailable") from error
 
 
 if __name__ == "__main__":

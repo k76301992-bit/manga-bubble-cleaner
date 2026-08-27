@@ -1,5 +1,5 @@
 import sharp from "sharp";
-import { requestTrainedInpainting } from "./inpainting-client";
+import { requestLocalComicTextDetection, requestTrainedInpainting } from "./inpainting-client";
 
 export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
 export type BubbleTextRegion = { x: number; y: number; width: number; height: number };
@@ -21,14 +21,15 @@ type QwenDetectionResponse = { regions?: Array<{ kind?: string; bbox_2d?: unknow
 type CleaningProfile = {
   tileHeight: number;
   requestTimeoutMs: number;
+  maxRegionsPerTile: number;
   useRemoteWhenLocalMisses: boolean;
   useTrainedInpainting: boolean;
 };
 
 export function cleaningProfileFor(quality: CleaningQuality): CleaningProfile {
-  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, useRemoteWhenLocalMisses: false, useTrainedInpainting: false };
-  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 15_000, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
-  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
+  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useTrainedInpainting: false };
+  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 15_000, maxRegionsPerTile: 36, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
+  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
 }
 
 function colorDistance(a: Pixel, b: Pixel) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
@@ -42,13 +43,88 @@ function uniqueRegions(regions: BubbleTextRegion[], maximum = 12) {
   })).slice(0, maximum);
 }
 
+export function mergeAdjacentTextLines(regions: BubbleTextRegion[]) {
+  const merged: BubbleTextRegion[] = [];
+  for (const region of [...regions].sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const candidate = merged.find((existing) => {
+      const existingBottom = existing.y + existing.height;
+      const verticalGap = region.y > existingBottom ? region.y - existingBottom : existing.y > region.y + region.height ? existing.y - (region.y + region.height) : 0;
+      const horizontalOverlap = Math.max(0, Math.min(existing.x + existing.width, region.x + region.width) - Math.max(existing.x, region.x));
+      const aligned = horizontalOverlap / Math.max(1, Math.min(existing.width, region.width)) >= 0.28 || Math.abs((existing.x + existing.width / 2) - (region.x + region.width / 2)) <= Math.max(existing.width, region.width) * 0.42;
+      return verticalGap <= Math.max(30, Math.max(existing.height, region.height) * 1.6) && aligned;
+    });
+    if (!candidate) merged.push({ ...region });
+    else {
+      const right = Math.max(candidate.x + candidate.width, region.x + region.width); const bottom = Math.max(candidate.y + candidate.height, region.y + region.height);
+      candidate.x = Math.min(candidate.x, region.x); candidate.y = Math.min(candidate.y, region.y); candidate.width = right - candidate.x; candidate.height = bottom - candidate.y;
+    }
+  }
+  return merged;
+}
+
 function jsonCandidates(raw: string) {
   const fenced = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1]);
   const firstObject = raw.indexOf("{"); const lastObject = raw.lastIndexOf("}");
   return [raw, ...fenced, firstObject >= 0 && lastObject > firstObject ? raw.slice(firstObject, lastObject + 1) : ""];
 }
 
-export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: number, height: number, includeSmoothColourBubbles = false): Promise<BubbleTextRegion[]> {
+export function hasLikelyClosedBubbleOutline(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
+  const isDark = (x: number, y: number) => {
+    const offset = (clamp(y, 0, height - 1) * width + clamp(x, 0, width - 1)) * 4;
+    return (source[offset] * 0.299) + (source[offset + 1] * 0.587) + (source[offset + 2] * 0.114) < 105;
+  };
+  const limit = clamp(Math.round(Math.max(region.width, region.height) * 0.8), 20, 112);
+  const offsets = [0.2, 0.5, 0.8];
+  const scan = (x: number, y: number, dx: number, dy: number) => {
+    for (let distance = 8; distance <= limit; distance += 1) if (isDark(x + dx * distance, y + dy * distance)) return true;
+    return false;
+  };
+  const topHits = offsets.filter((offset) => scan(Math.round(region.x + region.width * offset), region.y, 0, -1)).length;
+  const bottomHits = offsets.filter((offset) => scan(Math.round(region.x + region.width * offset), region.y + region.height, 0, 1)).length;
+  const leftHits = offsets.filter((offset) => scan(region.x, Math.round(region.y + region.height * offset), -1, 0)).length;
+  const rightHits = offsets.filter((offset) => scan(region.x + region.width, Math.round(region.y + region.height * offset), 1, 0)).length;
+  return topHits >= 2 && bottomHits >= 2 && leftHits >= 2 && rightHits >= 2;
+}
+
+type NeutralBubbleArea = BubbleTextRegion & { id: number };
+
+function findNeutralBubbleAreas(source: Buffer, width: number, height: number) {
+  const labels = new Int32Array(width * height);
+  const areas: NeutralBubbleArea[] = [];
+  let nextId = 1;
+  const isNeutralLight = (index: number) => {
+    const offset = index * 4; const red = source[offset]; const green = source[offset + 1]; const blue = source[offset + 2];
+    return source[offset + 3] > 220 && (red * 0.299) + (green * 0.587) + (blue * 0.114) >= 238 && Math.max(red, green, blue) - Math.min(red, green, blue) <= 26;
+  };
+  for (let start = 0; start < labels.length; start += 1) {
+    if (labels[start] || !isNeutralLight(start)) continue;
+    const id = nextId++; const queue = [start]; labels[start] = id; let cursor = 0; let count = 0; let minX = width; let maxX = 0; let minY = height; let maxY = 0;
+    while (cursor < queue.length) {
+      const index = queue[cursor++]; const x = index % width; const y = Math.floor(index / width); count += 1; minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const nx = x + dx; const ny = y + dy; const next = ny * width + nx;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height && !labels[next] && isNeutralLight(next)) { labels[next] = id; queue.push(next); }
+      }
+    }
+    const bubbleWidth = maxX - minX + 1; const bubbleHeight = maxY - minY + 1;
+    const touchesTile = minX === 0 || minY === 0 || maxX === width - 1 || maxY === height - 1;
+    if (!touchesTile && count >= 420 && bubbleWidth >= 34 && bubbleHeight >= 26 && bubbleWidth < width * 0.9 && bubbleHeight < height * 0.65) areas.push({ id, x: minX, y: minY, width: bubbleWidth, height: bubbleHeight });
+  }
+  return { labels, areas };
+}
+
+function isInsideNeutralBubble(region: BubbleTextRegion, areas: NeutralBubbleArea[], labels: Int32Array, width: number, height: number) {
+  const centerX = Math.round(region.x + region.width / 2); const centerY = Math.round(region.y + region.height / 2);
+  return areas.some((area) => {
+    if (area.width < region.width + 18 || area.height < region.height + 18 || area.width * area.height < region.width * region.height * 1.8) return false;
+    if (centerX <= area.x + 2 || centerX >= area.x + area.width - 3 || centerY <= area.y + 2 || centerY >= area.y + area.height - 3) return false;
+    const probes = [[region.x - 5, centerY], [region.x + region.width + 5, centerY], [centerX, region.y - 5], [centerX, region.y + region.height + 5]];
+    const hits = probes.filter(([x, y]) => labels[clamp(Math.round(y), 0, height - 1) * width + clamp(Math.round(x), 0, width - 1)] === area.id).length;
+    return hits >= 2;
+  });
+}
+
+export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: number, height: number, includeSmoothColourBubbles = false, maximumRegions = 12, requireClosedBubbleOutline = false): Promise<BubbleTextRegion[]> {
   const { data } = await sharp(imageBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const ink = new Uint8Array(width * height);
   for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
@@ -109,32 +185,37 @@ export async function detectFallbackDarkTextRegions(imageBuffer: Buffer, width: 
     const chroma = colors.reduce((sum, color) => sum + (Math.max(color[0], color[1], color[2]) - Math.min(color[0], color[1], color[2])), 0) / colors.length;
     return lightness >= 210 && spread < 58 && chroma < 38;
   };
-  const accepted = uniqueRegions(lineGroups.filter((group) => {
-    const validTextShape = group.glyphCount >= 1 && group.width >= 18 && group.width <= 620 && group.height >= 10 && group.height <= 150 && group.width / group.height >= 1.15;
-    return validTextShape && (likelySmoothLightBubble(group) || (includeSmoothColourBubbles && hasSmoothBubbleBackdrop(data, width, height, group)));
-  }).map(({ glyphCount: _glyphCount, ...region }) => region));
+  const bubbleGroups = mergeAdjacentTextLines(lineGroups);
+  const neutralBubbles = requireClosedBubbleOutline ? findNeutralBubbleAreas(data, width, height) : undefined;
+  const accepted = uniqueRegions(bubbleGroups.filter((group) => {
+    const validTextShape = group.width >= 18 && group.width <= 620 && group.height >= 10 && group.height <= 220 && group.width / group.height >= 0.45;
+    const eligibleBackdrop = likelySmoothLightBubble(group) || (includeSmoothColourBubbles && hasSmoothBubbleBackdrop(data, width, height, group));
+    const insideNeutralBubble = neutralBubbles && isInsideNeutralBubble(group, neutralBubbles.areas, neutralBubbles.labels, width, height);
+    const hasClosedOutline = hasLikelyClosedBubbleOutline(data, width, height, group);
+    return validTextShape && (eligibleBackdrop || Boolean(insideNeutralBubble)) && (!requireClosedBubbleOutline || (Boolean(insideNeutralBubble) && hasClosedOutline));
+  }), maximumRegions);
   return accepted;
 }
 
-export function parseQwenBubbleRegions(raw: string, width: number, height: number): BubbleTextRegion[] {
+export function parseQwenBubbleRegions(raw: string, width: number, height: number, maximumRegions = 12): BubbleTextRegion[] {
   for (const candidate of jsonCandidates(raw)) {
     try {
       const parsed = JSON.parse(candidate) as QwenDetectionResponse;
       if (!Array.isArray(parsed.regions)) continue;
-      return parsed.regions.flatMap((region) => {
+      return uniqueRegions(parsed.regions.flatMap((region) => {
         if (region.kind && region.kind !== "dialogue" && region.kind !== "caption") return [];
         if (!Array.isArray(region.bbox_2d) || region.bbox_2d.length !== 4 || !region.bbox_2d.every((value) => typeof value === "number" && Number.isFinite(value))) return [];
         const [ymin, xmin, ymax, xmax] = region.bbox_2d as number[];
         const left = clamp(Math.round(xmin), 0, width - 1); const top = clamp(Math.round(ymin), 0, height - 1);
         const right = clamp(Math.round(xmax), left + 1, width); const bottom = clamp(Math.round(ymax), top + 1, height);
         return right - left < 8 || bottom - top < 8 ? [] : [{ x: left, y: top, width: right - left, height: bottom - top }];
-      });
+      }), maximumRegions);
     } catch { /* The model may include prose before its JSON. */ }
   }
   return [];
 }
 
-async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, height: number, requestTimeoutMs: number) {
+async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, height: number, requestTimeoutMs: number, maximumRegions: number) {
   const apiKey = process.env.EXTERNAL_OPENAI_API_KEY;
   if (!apiKey) throw new Error("مفتاح موفر كشف النص غير مضبوط.");
   if (imageBuffer.length > MAX_INPUT_BYTES) throw new Error("مقطع الصورة أكبر من حد موفر كشف النص.");
@@ -165,7 +246,7 @@ async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, heigh
       const content = payload.choices?.[0]?.message?.content;
       if (typeof content !== "string") throw new Error("رد موفر كشف النص لا يحتوي نصًا صالحًا.");
       if (content.trim() === "[Qwen: empty response]") return [];
-      return uniqueRegions(parseQwenBubbleRegions(content, width, height));
+      return parseQwenBubbleRegions(content, width, height, maximumRegions);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("رد موفر")) throw error;
       throw new Error("رد موفر كشف النص ليس بصيغة JSON قابلة للتحليل.");
@@ -198,9 +279,22 @@ function inferLightBubbleFill(source: Buffer, width: number, height: number, reg
   const samples: Pixel[] = [];
   for (let x = x0; x <= x1; x += 2) { samples.push(read(x, y0), read(x, y1)); }
   for (let y = y0 + 2; y < y1; y += 2) { samples.push(read(x0, y), read(x1, y)); }
-  const light = samples.filter((color) => color[3] > 220 && brightness(color) >= 180 && Math.max(color[0], color[1], color[2]) - Math.min(color[0], color[1], color[2]) <= 105);
+  const light = samples.filter((color) => color[3] > 220 && brightness(color) >= 230 && Math.max(color[0], color[1], color[2]) - Math.min(color[0], color[1], color[2]) <= 42);
   if (light.length < Math.max(10, Math.floor(samples.length * 0.3))) return undefined;
   return [median(light.map((color) => color[0])), median(light.map((color) => color[1])), median(light.map((color) => color[2])), 255];
+}
+
+export function hasNeutralLightBubbleInterior(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
+  let light = 0; let samples = 0;
+  const insetX = Math.max(2, Math.round(region.width * 0.08)); const insetY = Math.max(2, Math.round(region.height * 0.08));
+  for (let y = region.y + insetY; y < region.y + region.height - insetY; y += 4) for (let x = region.x + insetX; x < region.x + region.width - insetX; x += 4) {
+    const offset = (clamp(y, 0, height - 1) * width + clamp(x, 0, width - 1)) * 4;
+    const red = source[offset]; const green = source[offset + 1]; const blue = source[offset + 2];
+    const neutral = Math.max(red, green, blue) - Math.min(red, green, blue) <= 70;
+    if (source[offset + 3] > 220 && brightness([red, green, blue, source[offset + 3]]) >= 238 && Math.max(red, green, blue) - Math.min(red, green, blue) <= 26 && neutral) light += 1;
+    samples += 1;
+  }
+  return samples >= 8 && light / samples >= 0.52;
 }
 
 /**
@@ -224,7 +318,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     const samples: Pixel[] = []; for (let offset = -2; offset <= 2; offset += 1) samples.push(direction === "x" ? read(clamp(x + offset, 0, width - 1), y) : read(x, clamp(y + offset, 0, height - 1)));
     return [samples.reduce((sum, c) => sum + c[0], 0) / 5, samples.reduce((sum, c) => sum + c[1], 0) / 5, samples.reduce((sum, c) => sum + c[2], 0) / 5, 255];
   };
-  for (const region of uniqueRegions(regions)) {
+  for (const region of uniqueRegions(regions, 48)) {
     const lightFill = inferLightBubbleFill(source, width, height, region);
     const smooth = !lightFill && hasSmoothBubbleBackdrop(source, width, height, region);
     if (!lightFill && !smooth) continue;
@@ -282,7 +376,7 @@ function expandBinaryMask(mask: Uint8Array, width: number, height: number, passe
 export function buildTrainedInpaintMask(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
   const mask = new Uint8Array(width * height);
   const read = (x: number, y: number): Pixel => { const o = (y * width + x) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
-  for (const region of uniqueRegions(regions)) {
+  for (const region of uniqueRegions(regions, 48)) {
     const background = regionBackground(source, width, height, region);
     const x0 = clamp(region.x, 1, width - 2); const y0 = clamp(region.y, 1, height - 2);
     const x1 = clamp(region.x + region.width, x0 + 1, width - 2); const y1 = clamp(region.y + region.height, y0 + 1, height - 2);
@@ -303,7 +397,7 @@ function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: nu
 
 async function inpaintWithTrainedModel(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
   let output = Buffer.from(source); const globalMask = buildTrainedInpaintMask(source, width, height, regions); let repairedRegions = 0;
-  for (const region of uniqueRegions(regions)) {
+  for (const region of uniqueRegions(regions, 48)) {
     const padding = clamp(Math.round(Math.max(region.width, region.height) * 0.35), 32, 128);
     const left = clamp(region.x - padding, 0, width - 1); const top = clamp(region.y - padding, 0, height - 1);
     const right = clamp(region.x + region.width + padding, left + 1, width); const bottom = clamp(region.y + region.height + padding, top + 1, height);
@@ -356,17 +450,26 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // Detection only: JPEG significantly reduces the remote request size while preserving tile coordinates.
     const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).jpeg({ quality: 92, chromaSubsampling: "4:4:4" }).toBuffer();
     await input.onTile?.({ tileIndex, tileCount, status: "detecting" });
-    const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, profile.useTrainedInpainting);
-    const remote = profile.useRemoteWhenLocalMisses && !remoteDetectionUnavailable
-      ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs).catch((error) => {
+    // The local detector is intentionally restricted to neutral bubbles: the wider coloured-backdrop fallback matched artwork in the retained chapter.
+    const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, false, profile.maxRegionsPerTile, true);
+    const comicRegions = profile.useTrainedInpainting ? await requestLocalComicTextDetection(visionInput) : undefined;
+    const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
+    const comicBubbleRegions = (comicRegions ?? []).flatMap(({ confidence: _confidence, ...region }) => {
+      const valid = region.x >= 0 && region.y >= 0 && region.x + region.width <= width && region.y + region.height <= currentHeight;
+      const lightBubbleFill = inferLightBubbleFill(tileData, width, currentHeight, region);
+      const insideNeutralBubble = comicNeutralBubbles && isInsideNeutralBubble(region, comicNeutralBubbles.areas, comicNeutralBubbles.labels, width, currentHeight);
+      return valid && Boolean(lightBubbleFill) && Boolean(insideNeutralBubble) && hasLikelyClosedBubbleOutline(tileData, width, currentHeight, region) ? [region] : [];
+    });
+    const remote = profile.useRemoteWhenLocalMisses && comicRegions === undefined && !remoteDetectionUnavailable
+      ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).catch((error) => {
         console.warn("[cleaner] remote detection skipped for one tile", error instanceof Error ? error.message : error);
         remoteDetectionUnavailable = true;
         return [] as BubbleTextRegion[];
       })
       : [];
     if (remote.length) remoteDetectionTiles += 1;
-    const detected = remote.length ? uniqueRegions([...remote, ...local]) : uniqueRegions(local); detectedRegions += detected.length;
-    const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)]);
+    const detected = comicBubbleRegions.length ? uniqueRegions([...comicBubbleRegions, ...local], profile.maxRegionsPerTile) : remote.length ? uniqueRegions([...remote, ...local], profile.maxRegionsPerTile) : uniqueRegions(local, profile.maxRegionsPerTile); detectedRegions += detected.length;
+    const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)], 48);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
     const localRegions = profile.useTrainedInpainting ? regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : regions;
     const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
