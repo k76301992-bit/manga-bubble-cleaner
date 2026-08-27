@@ -13,7 +13,20 @@ function safeFolderName(value: string) {
   return `${parse(value).name.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "manhwa-results"}-cleaned`;
 }
 
+function configuredUserDrive() {
+  const clientId = process.env.GDRIVE_CLIENT_ID?.trim();
+  const clientSecret = process.env.GDRIVE_CLIENT_SECRET?.trim();
+  const refreshToken = process.env.GDRIVE_REFRESH_TOKEN?.trim();
+  if (!clientId && !clientSecret && !refreshToken) return undefined;
+  if (!clientId || !clientSecret || !refreshToken) throw new Error("بيانات OAuth الخاصة بـ Google Drive غير مكتملة: اضبط Client ID وClient Secret وRefresh Token معًا.");
+  const auth = new google.auth.OAuth2(clientId, clientSecret);
+  auth.setCredentials({ refresh_token: refreshToken });
+  return google.drive({ version: "v3", auth });
+}
+
 function configuredDrive() {
+  const userDrive = configuredUserDrive();
+  if (userDrive) return userDrive;
   const rawCredentials = process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim();
   if (!rawCredentials) throw new Error("لم يُضبط حساب خدمة Google Drive على الخادم.");
   let credentials: JWTInput;
@@ -21,6 +34,13 @@ function configuredDrive() {
   catch { throw new Error("صيغة GOOGLE_SERVICE_ACCOUNT_JSON غير صالحة."); }
   const auth = new google.auth.GoogleAuth({ credentials, scopes: [DRIVE_SCOPE] });
   return google.drive({ version: "v3", auth });
+}
+
+export async function validateGoogleUserDriveCredentials() {
+  const drive = configuredUserDrive();
+  if (!drive) return false;
+  const about = await drive.about.get({ fields: "storageQuota(limit,usage),user(emailAddress)" });
+  return Boolean(about.data.user?.emailAddress);
 }
 
 export async function validateGoogleServiceAccountCredentials() {

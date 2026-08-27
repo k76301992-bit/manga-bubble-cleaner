@@ -14,7 +14,10 @@
 | `SERVICE_API_KEY` | الخادم فقط | لا | حماية اختيارية للاتصالات الخادمية، مثل بوت Discord. |
 | `DISCORD_BOT_TOKEN` | الخادم فقط | لتشغيل البوت | رمز البوت من بوابة مطوري Discord. لا يوضع في التطبيق أو GitHub. |
 | `DISCORD_ENABLED` | الخادم فقط | لتشغيل البوت | عيّنه إلى `true` لتشغيل البوت العام بعد دعوته إلى الخوادم المطلوبة. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | الخادم فقط | لمسار Google Drive | محتوى JSON الكامل لمفتاح حساب خدمة Google بعد تفعيل Drive API؛ لا تستخدم مفتاح API عاديًا. |
+| `GDRIVE_CLIENT_ID` | الخادم فقط | لتسليم Drive بحسابك | OAuth Client ID لحساب Google الذي سيملك مجلدات النتائج. |
+| `GDRIVE_CLIENT_SECRET` | الخادم فقط | لتسليم Drive بحسابك | OAuth Client Secret المطابق؛ لا يوضع في تطبيق Expo أو Discord. |
+| `GDRIVE_REFRESH_TOKEN` | الخادم فقط | لتسليم Drive بحسابك | رمز التحديث الذي يسمح للخادم بالرفع إلى Drive الخاص بك عند تجاوز حد Discord. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | الخادم فقط | احتياطي فقط | حساب خدمة قديم يُستخدم فقط إذا لم تُضبط متغيرات OAuth الثلاثة؛ لا يملك مساحة Drive شخصية افتراضيًا. |
 | `INFERENCE_ENABLED` | الخادم فقط | لا | اتركه غير مضبوط أو اجعله `true` لتفعيل Anime-Manga Big-LaMa؛ استخدم `false` لتعطيل الترميم المدرب مؤقتًا والرجوع للمحرك المحلي. |
 | `INFERENCE_PORT` | الخادم فقط | لا | منفذ الخدمة الداخلية فقط؛ الافتراضي `8090` ولا يعرّض إلى الإنترنت. |
 | `INFERENCE_URL` | الخادم فقط | لا | رابط Node الداخلي للخدمة؛ الافتراضي `http://127.0.0.1:8090`. |
@@ -40,6 +43,8 @@ EXPO_PUBLIC_API_BASE_URL=https://cleaner.example.com
 > `EXPO_PUBLIC_API_BASE_URL` عنوان عام وليس سرًا؛ أما كل المتغيرات الأخرى فتبقى في بيئة الخادم. إذا فُعّل `SERVICE_API_KEY`، يجب أن يرسله بوت Discord من خادمه الخاص. لا تضمّنه في IPA.
 
 > لكي يلتقط البوت رسالة المرفقات أو ZIP التالية بعد اختيار المستخدم لها من اللوحة، فعّل **Message Content Intent** في صفحة Bot ضمن بوابة مطوري Discord، وأضف صلاحية **Read Message History** عند إنشاء رابط الدعوة.
+
+> لا يحتاج مسار رفع النتائج إلى `GDRIVE_API_KEY`. عند ضبط `GDRIVE_CLIENT_ID` و`GDRIVE_CLIENT_SECRET` و`GDRIVE_REFRESH_TOKEN` معًا، يرفع البوت المجلد إلى Google Drive الخاص بك. أبق هذه القيم خادمية فقط.
 
 ## خدمة الترميم المدربة
 
