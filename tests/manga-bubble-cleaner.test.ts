@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { buildCleaningPrompt, decodeImageDataUrl, ensurePublicImageUrl, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile } from "../server/manga-bubble-cleaner";
+import { buildCleaningPrompt, decodeImageDataUrl, ensurePublicImageUrl, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, parseQwenBubbleRegions } from "../server/manga-bubble-cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("builds a high-detail prompt that preserves artwork and limits edits to dialogue text", () => {
@@ -63,9 +63,11 @@ describe("manga bubble cleanup safeguards", () => {
     }
     const repaired = inpaintDetectedTextBoxes(source, 49, 49, [{ x: 20, y: 22, width: 9, height: 7 }]);
     const center = (25 * 49 + 24) * 4;
+    const clearBackdrop = (19 * 49 + 18) * 4;
     const untouched = (2 * 49 + 2) * 4;
     expect(repaired[center]).toBeLessThan(160);
     expect(repaired[center + 1]).toBeLessThan(80);
+    expect(Math.abs(repaired[clearBackdrop] - source[clearBackdrop])).toBeLessThan(16);
     expect(repaired[untouched]).toBe(source[untouched]);
   });
 
@@ -73,6 +75,19 @@ describe("manga bubble cleanup safeguards", () => {
     const adjustment = [{ mode: "include" as const, points: [{ x: 0.2, y: 0.55 }, { x: 0.6, y: 0.65 }] }];
     expect(manualRegionsForTile(adjustment, 1000, 10_000, 0, 2400)).toEqual([]);
     expect(manualRegionsForTile(adjustment, 1000, 10_000, 4800, 2400)).toEqual([{ x: 200, y: 700, width: 400, height: 1000 }]);
+  });
+
+  it("extracts qwen pixel boxes from a Markdown-wrapped JSON response", () => {
+    const raw = "I found the dialogue.\n```json\n{\"coordinate_space\":\"pixels\",\"regions\":[{\"kind\":\"dialogue\",\"bbox_2d\":[210,318,290,572]}]}\n```";
+    expect(parseQwenBubbleRegions(raw, 900, 1100)).toEqual([{ x: 318, y: 210, width: 254, height: 80 }]);
+  });
+
+  it("rejects qwen regions that are too small or belong to non-dialogue text", () => {
+    const raw = JSON.stringify({ regions: [
+      { kind: "sound-effect", bbox_2d: [10, 10, 70, 70] },
+      { kind: "dialogue", bbox_2d: [10, 10, 16, 16] },
+    ] });
+    expect(parseQwenBubbleRegions(raw, 900, 1100)).toEqual([]);
   });
 
   it("uses whole-box repair for a smooth gradient but rejects a textured artwork ring", () => {

@@ -1,5 +1,4 @@
 import { generateImage } from "./_core/imageGeneration";
-import { invokeLLM } from "./_core/llm";
 import { storageGetSignedUrl, storagePut } from "./storage";
 import sharp from "sharp";
 
@@ -9,7 +8,8 @@ type ManualMaskAdjustment = { mode: "include" | "exclude"; points: Array<{ x: nu
 
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
-const TILE_HEIGHT = 2400;
+const TILE_HEIGHT = 1200;
+const EXTERNAL_QWEN_BASE_URL = "https://ggg-production-739f.up.railway.app/v1";
 
 export function ensurePublicImageUrl(value: string) {
   let url: URL;
@@ -60,40 +60,66 @@ function cleanFileName(fileName: string) {
   return fileName.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").slice(0, 96) || "manga-page.png";
 }
 
-async function detectRegions(tileUrl: string, width: number, height: number, instruction: string): Promise<BubbleTextRegion[]> {
-  const result = await invokeLLM({
-    model: "gemini-3.1-pro-preview",
-    maxTokens: 2200,
-    messages: [{ role: "user", content: [
-      { type: "text", text: `${instruction} Return JSON only: an array of objects in the form {"box_2d":[ymin,xmin,ymax,xmax],"label":"dialogue"}, where each coordinate is normalized from 0 to 1000. Make every box enclose letters only, never the bubble outline or tail.` },
-      { type: "image_url", image_url: { url: tileUrl, detail: "high" } },
-    ] }], responseFormat: { type: "json_object" },
-  });
-  const content = result.choices[0]?.message.content;
-  const raw = typeof content === "string"
-    ? content
-    : (content ?? []).filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n");
-  try {
-    const parsed = JSON.parse(raw || "[]") as Array<{ box_2d?: number[] }> | { boxes?: BubbleTextRegion[] };
-    if (Array.isArray(parsed)) {
-      return parsed.flatMap((item) => {
-        const box = item.box_2d;
-        if (!box || box.length !== 4) return [];
-        const [ymin, xmin, ymax, xmax] = box;
-        if (![ymin, xmin, ymax, xmax].every(Number.isFinite) || ymax <= ymin || xmax <= xmin) return [];
-        return [{ x: Math.round((xmin / 1000) * width), y: Math.round((ymin / 1000) * height), width: Math.round(((xmax - xmin) / 1000) * width), height: Math.round(((ymax - ymin) / 1000) * height) }];
-      });
-    }
-    return (parsed.boxes ?? []).filter((box) => Number.isFinite(box.x) && Number.isFinite(box.y) && box.width > 4 && box.height > 4 && box.x >= 0 && box.y >= 0);
-  } catch { return []; }
+type QwenDetectionResponse = { regions?: Array<{ kind?: string; bbox_2d?: unknown; text?: string }> };
+
+function jsonCandidates(raw: string) {
+  const fenced = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1]);
+  const firstObject = raw.indexOf("{"); const lastObject = raw.lastIndexOf("}");
+  return [raw, ...fenced, firstObject >= 0 && lastObject > firstObject ? raw.slice(firstObject, lastObject + 1) : ""];
 }
 
-async function detectBubbleTextRegions(tileUrl: string, width: number, height: number): Promise<BubbleTextRegion[]> {
-  const generalInstruction = "Find every readable dialogue or narration text group inside speech bubbles or caption boxes in this manga crop, including bubbles with white, yellow, red, black, translucent, or patterned fills. Ignore decorative sound effects, logos, panel borders, and text outside bubbles. Use a box whenever dialogue text is visible; do not omit colored bubbles.";
-  const coloredRecoveryInstruction = "Perform a focused recovery pass. Find dialogue lettering inside dark, black, red, colored, translucent, or gradient-filled speech bubbles and caption boxes in this manga crop, including white lettering on dark fills. Do not select sound effects, logos, panel borders, or lettering outside a closed bubble. Include the text even when its bubble is over dramatic artwork.";
-  const general = await detectRegions(tileUrl, width, height, generalInstruction);
-  const coloredRecovery = await detectRegions(tileUrl, width, height, coloredRecoveryInstruction);
-  return uniqueRegions([...general, ...coloredRecovery]);
+/** Parses pixel coordinates returned by qwen, including responses wrapped in prose or Markdown fences. */
+export function parseQwenBubbleRegions(raw: string, width: number, height: number): BubbleTextRegion[] {
+  for (const candidate of jsonCandidates(raw)) {
+    try {
+      const parsed = JSON.parse(candidate) as QwenDetectionResponse;
+      if (!Array.isArray(parsed.regions)) continue;
+      return parsed.regions.flatMap((region) => {
+        if (region.kind && region.kind !== "dialogue" && region.kind !== "caption") return [];
+        if (!Array.isArray(region.bbox_2d) || region.bbox_2d.length !== 4 || !region.bbox_2d.every((value) => typeof value === "number" && Number.isFinite(value))) return [];
+        const [ymin, xmin, ymax, xmax] = region.bbox_2d as number[];
+        const left = clamp(Math.round(xmin), 0, width - 1); const top = clamp(Math.round(ymin), 0, height - 1);
+        const right = clamp(Math.round(xmax), left + 1, width); const bottom = clamp(Math.round(ymax), top + 1, height);
+        if (right - left < 8 || bottom - top < 8) return [];
+        return [{ x: left, y: top, width: right - left, height: bottom - top }];
+      });
+    } catch { /* Try the next JSON candidate. */ }
+  }
+  return [];
+}
+
+async function detectQwenBubbleTextRegions(imageBuffer: Buffer, width: number, height: number): Promise<BubbleTextRegion[]> {
+  const apiKey = process.env.EXTERNAL_OPENAI_API_KEY;
+  if (!apiKey) throw new Error("مفتاح موفر كشف النص غير مضبوط.");
+  if (imageBuffer.length > MAX_INPUT_BYTES) throw new Error("مقطع الصورة أكبر من حد موفر كشف النص.");
+  const prompt = `Inspect this ${width}x${height} manhwa crop. Return one JSON object only: {"coordinate_space":"pixels","regions":[{"kind":"dialogue"|"caption","bbox_2d":[ymin,xmin,ymax,xmax],"text":"optional"}]}. Find every readable dialogue or narration text group inside a closed speech bubble or caption box, including white, yellow, red, black, translucent, patterned, or gradient fills. Each bbox must be TIGHT around visible text ink, including fill, outline, glow, and shadow, but never include the bubble border, tail, or empty bubble background. Ignore logos, sound effects, panel borders, and all lettering outside closed bubbles. Use exact pixel coordinates for this supplied image. If there is no eligible text, return {"coordinate_space":"pixels","regions":[]}.`;
+  const response = await fetch(`${EXTERNAL_QWEN_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      model: "qwen", temperature: 0, max_tokens: 1200, stream: false,
+      messages: [{ role: "user", content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${imageBuffer.toString("base64")}` } },
+      ] }],
+    }),
+    signal: AbortSignal.timeout(180_000),
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`تعذر كشف النص عبر الموفر الخارجي (${response.status}): ${body.slice(0, 240)}`);
+  try {
+    const payload = JSON.parse(body) as { choices?: Array<{ message?: { content?: unknown } }> };
+    const content = payload.choices?.[0]?.message?.content;
+    if (typeof content !== "string") throw new Error("رد موفر كشف النص لا يحتوي نصًا صالحًا.");
+    return uniqueRegions(parseQwenBubbleRegions(content, width, height));
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("رد موفر")) throw error;
+    throw new Error("رد موفر كشف النص ليس بصيغة JSON قابلة للتحليل.");
+  }
+}
+
+async function detectBubbleTextRegions(tileBuffer: Buffer, width: number, height: number): Promise<BubbleTextRegion[]> {
+  return detectQwenBubbleTextRegions(tileBuffer, width, height);
 }
 
 function uniqueRegions(regions: BubbleTextRegion[]) {
@@ -112,8 +138,9 @@ const colorDistance = (a: Pixel, b: Pixel) => Math.hypot(a[0] - b[0], a[1] - b[1
 /** Returns true only when a clean ring around the detected lettering behaves like a smooth bubble fill. */
 export function hasSmoothBubbleBackdrop(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
   const read = (x: number, y: number): Pixel => { const offset = (y * width + x) * 4; return [source[offset], source[offset + 1], source[offset + 2], source[offset + 3]]; };
-  const x0 = clamp(region.x - 8, 2, width - 3); const y0 = clamp(region.y - 8, 2, height - 3);
-  const x1 = clamp(region.x + region.width + 8, x0 + 1, width - 3); const y1 = clamp(region.y + region.height + 8, y0 + 1, height - 3);
+  const ringPadding = 20;
+  const x0 = clamp(region.x - ringPadding, 2, width - 3); const y0 = clamp(region.y - ringPadding, 2, height - 3);
+  const x1 = clamp(region.x + region.width + ringPadding, x0 + 1, width - 3); const y1 = clamp(region.y + region.height + ringPadding, y0 + 1, height - 3);
   let sum = 0; let rough = 0; let samples = 0;
   const inspect = (x: number, y: number) => {
     const current = read(x, y); const right = read(x + 1, y); const below = read(x, y + 1);
@@ -137,29 +164,31 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
   };
   for (const region of uniqueRegions(regions)) {
     const smoothBackdrop = hasSmoothBubbleBackdrop(source, width, height, region);
-    const layerPadding = smoothBackdrop ? clamp(Math.round(Math.min(region.width, region.height) * 0.08), 8, 16) : 4;
+    const layerPadding = smoothBackdrop ? clamp(Math.round(Math.min(region.width, region.height) * 0.22), 14, 22) : 4;
     const x0 = clamp(region.x - layerPadding, 6, width - 7); const y0 = clamp(region.y - layerPadding, 6, height - 7);
     const x1 = clamp(region.x + region.width + layerPadding, x0 + 1, width - 7); const y1 = clamp(region.y + region.height + layerPadding, y0 + 1, height - 7);
     const backdropAt = (x: number, y: number) => {
       const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
+      if (smoothBackdrop) return horizontal;
       const vertical = mix(averageAt(x, y0 - 4, "x"), averageAt(x, y1 + 4, "x"), (y - y0) / Math.max(1, y1 - y0));
       return mix(horizontal, vertical, 0.35);
     };
-    if (smoothBackdrop) {
-      for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) write(x, y, backdropAt(x, y));
-      continue;
-    }
     const boxWidth = x1 - x0 + 1; const boxHeight = y1 - y0 + 1;
     const mask = new Uint8Array(boxWidth * boxHeight);
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
       const backdrop = backdropAt(x, y);
       const current = read(x, y);
-      if (colorDistance(current, backdrop) > 20) mask[(y - y0) * boxWidth + x - x0] = 1;
+      if (colorDistance(current, backdrop) > (smoothBackdrop ? 50 : 20)) mask[(y - y0) * boxWidth + x - x0] = 1;
     }
     const expanded = new Uint8Array(mask);
-    for (let y = 2; y < boxHeight - 2; y += 1) for (let x = 2; x < boxWidth - 2; x += 1) {
-      if (!mask[y * boxWidth + x]) continue;
-      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) expanded[(y + dy) * boxWidth + x + dx] = 1;
+    const dilationPasses = smoothBackdrop ? 5 : 1;
+    for (let pass = 0; pass < dilationPasses; pass += 1) {
+      const next = new Uint8Array(expanded);
+      for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) {
+        if (!expanded[y * boxWidth + x]) continue;
+        for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1;
+      }
+      expanded.set(next);
     }
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
       if (!expanded[(y - y0) * boxWidth + x - x0]) continue;
@@ -213,15 +242,14 @@ export async function cleanMangaTile(input: { sourceKey: string; fileName: strin
   const currentHeight = Math.min(TILE_HEIGHT, height - top);
   const tile = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const tileBuffer = await sharp(tile.data, { raw: { width, height: currentHeight, channels: 4 } }).png().toBuffer();
-  const storedTile = await storagePut(`manga-bubble-cleaner/tiles/${Date.now()}-${input.tileIndex}.png`, tileBuffer, "image/png");
-  const detectedRegions = await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight);
+  const detectedRegions = await detectBubbleTextRegions(tileBuffer, width, currentHeight);
   const manualRegions = manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight);
   const regions = uniqueRegions([...detectedRegions, ...manualRegions]);
   const repairedRaw = inpaintDetectedTextBoxes(tile.data, width, currentHeight, regions);
   const repairedTile = await sharp(repairedRaw, { raw: { width, height: currentHeight, channels: 4 } }).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
   const finalBuffer = await sharp(sourceBuffer).composite([{ input: repairedTile, left: 0, top }]).png({ compressionLevel: 6, adaptiveFiltering: true }).toBuffer();
   const result = await storagePut(`manga-bubble-cleaner/tile-results/${Date.now()}-${input.tileIndex}-${cleanFileName(input.fileName).replace(/\.[^.]+$/, "")}.png`, finalBuffer, "image/png");
-  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / TILE_HEIGHT), detectedRegions: detectedRegions.length, manualRegions: manualRegions.length, processedRegions: regions.length };
+  return { resultKey: result.key, resultUrl: result.url, tileCount: Math.ceil(height / TILE_HEIGHT), detectedRegions: detectedRegions.length, detectedBoxes: detectedRegions, manualRegions: manualRegions.length, processedRegions: regions.length };
 }
 
 export async function cleanStoredMangaBubbleImage(input: { sourceKey: string; sourceUrl?: string; fileName: string; quality: CleaningQuality; width: number; height: number; mimeType: string }) {
@@ -239,8 +267,7 @@ export async function cleanStoredMangaBubbleImage(input: { sourceKey: string; so
   for (let top = 0; top < height; top += tileHeight) {
     const currentHeight = Math.min(tileHeight, height - top);
     const tileBuffer = await sharp(sourceBuffer).extract({ left: 0, top, width, height: currentHeight }).png().toBuffer();
-    const storedTile = await storagePut(`manga-bubble-cleaner/tiles/${Date.now()}-${top}.png`, tileBuffer, "image/png");
-    const boxes = await detectBubbleTextRegions(await storageGetSignedUrl(storedTile.key), width, currentHeight);
+    const boxes = await detectBubbleTextRegions(tileBuffer, width, currentHeight);
     regions.push(...boxes.map((box) => ({ ...box, y: box.y + top })));
   }
 

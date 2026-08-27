@@ -188,7 +188,7 @@ export function BatchProvider({ children }: { children: React.ReactNode }) {
         sourceKey = stored.sourceKey;
         updateImage(image.id, { sourceKey });
       }
-      const tileCount = Math.ceil(image.height / 2400);
+      const tileCount = Math.ceil(image.height / 1200);
       let currentKey = sourceKey;
       let resultUri = image.sourceUri;
       for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
