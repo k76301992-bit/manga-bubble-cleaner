@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { normalizeCleanerSettings } from "../lib/cleaner-settings";
-import { cleanImageInMemory, cleaningProfileFor, detectFallbackDarkTextRegions, hasLikelyClosedBubbleOutline, hasNeutralLightBubbleInterior, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, manualRegionsForTile, mergeAdjacentTextLines, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
+import { cleanImageInMemory, cleaningProfileFor, detectFallbackDarkTextRegions, hasLikelyClosedBubbleOutline, hasNeutralLightBubbleInterior, hasSmoothBubbleBackdrop, inpaintDetectedTextBoxes, isLikelyQrTextCluster, manualRegionsForTile, mergeAdjacentTextLines, parseQwenBubbleRegions, shouldUseLocalBubbleRepair } from "../server/standalone/cleaner";
 
 describe("manga bubble cleanup safeguards", () => {
   it("normalizes incomplete local settings without weakening the quality default", () => {
@@ -60,10 +60,15 @@ describe("manga bubble cleanup safeguards", () => {
   });
 
   it("uses materially different speed and detail profiles", () => {
-    expect(cleaningProfileFor("balanced").tileHeight).toBeGreaterThan(cleaningProfileFor("maximum-detail").tileHeight);
-    expect(cleaningProfileFor("balanced").useRemoteWhenLocalMisses).toBe(false);
-    expect(cleaningProfileFor("maximum-detail").useRemoteWhenLocalMisses).toBe(true);
-    expect(cleaningProfileFor("maximum-detail").maxRegionsPerTile).toBeGreaterThan(cleaningProfileFor("balanced").maxRegionsPerTile);
+    const fast = cleaningProfileFor("balanced"); const detail = cleaningProfileFor("maximum-detail");
+    expect(fast.tileHeight).toBeGreaterThan(detail.tileHeight);
+    expect(fast.useRemoteWhenLocalMisses).toBe(false);
+    expect(fast.useTrainedInpainting).toBe(false);
+    expect(detail.useRemoteWhenLocalMisses).toBe(true);
+    expect(detail.useRemoteAlongsideLocal).toBe(true);
+    expect(detail.useTrainedInpainting).toBe(true);
+    expect(detail.trainedOnly).toBe(true);
+    expect(detail.maxRegionsPerTile).toBeGreaterThan(fast.maxRegionsPerTile);
   });
 
   it("returns a PNG with exactly the input dimensions", async () => {
@@ -115,6 +120,18 @@ describe("manga bubble cleanup safeguards", () => {
     expect(hasSmoothBubbleBackdrop(textured, 48, 48, region)).toBe(false);
   });
 
+  it("recognizes a smooth coloured area enclosed by a dark speech-bubble outline", () => {
+    const width = 120; const height = 100; const source = Buffer.alloc(width * height * 4, 255);
+    for (let y = 12; y < 88; y += 1) for (let x = 12; x < 108; x += 1) {
+      const offset = (y * width + x) * 4;
+      source[offset] = 145; source[offset + 1] = 28; source[offset + 2] = 42;
+      if (x === 12 || x === 107 || y === 12 || y === 87) source[offset] = source[offset + 1] = source[offset + 2] = 0;
+    }
+    const region = { x: 43, y: 43, width: 32, height: 14 };
+    expect(hasLikelyClosedBubbleOutline(source, width, height, region)).toBe(true);
+    expect(hasSmoothBubbleBackdrop(source, width, height, region)).toBe(true);
+  });
+
   it("requires evidence of an enclosing outline before local cleanup touches a light scene", () => {
     const width = 160; const height = 120; const raw = Buffer.alloc(width * height * 4, 248);
     const region = { x: 55, y: 45, width: 50, height: 24 };
@@ -131,6 +148,11 @@ describe("manga bubble cleanup safeguards", () => {
     const darkInterface = Buffer.alloc(width * height * 4, 18);
     for (let y = 29; y < 51; y += 1) for (let x = 40; x < 80; x += 1) { const offset = (y * width + x) * 4; darkInterface[offset] = darkInterface[offset + 1] = darkInterface[offset + 2] = 250; darkInterface[offset + 3] = 255; }
     expect(hasNeutralLightBubbleInterior(darkInterface, width, height, region)).toBe(false);
+  });
+
+  it("rejects the low-confidence square QR signature without rejecting a dialogue text box", () => {
+    expect(isLikelyQrTextCluster({ x: 92, y: 190, width: 188, height: 180, confidence: 0.455 })).toBe(true);
+    expect(isLikelyQrTextCluster({ x: 216, y: 2180, width: 284, height: 220, confidence: 0.733 })).toBe(false);
   });
 
   it("merges adjacent aligned dialogue lines before bubble validation", () => {

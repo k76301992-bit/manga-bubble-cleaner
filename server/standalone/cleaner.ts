@@ -1,5 +1,5 @@
 import sharp from "sharp";
-import { requestLocalComicTextDetection, requestTrainedInpainting } from "./inpainting-client";
+import { requestLocalComicTextDetection, requestLocalComicTextDetectionWithMask, requestTrainedInpainting } from "./inpainting-client";
 
 export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
 export type BubbleTextRegion = { x: number; y: number; width: number; height: number };
@@ -23,13 +23,15 @@ type CleaningProfile = {
   requestTimeoutMs: number;
   maxRegionsPerTile: number;
   useRemoteWhenLocalMisses: boolean;
+  useRemoteAlongsideLocal: boolean;
   useTrainedInpainting: boolean;
+  trainedOnly: boolean;
 };
 
 export function cleaningProfileFor(quality: CleaningQuality): CleaningProfile {
-  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useTrainedInpainting: false };
-  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 15_000, maxRegionsPerTile: 36, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
-  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useTrainedInpainting: true };
+  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useRemoteAlongsideLocal: false, useTrainedInpainting: false, trainedOnly: false };
+  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 15_000, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true };
+  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: false, useTrainedInpainting: true, trainedOnly: false };
 }
 
 function colorDistance(a: Pixel, b: Pixel) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
@@ -297,6 +299,11 @@ export function hasNeutralLightBubbleInterior(source: Buffer, width: number, hei
   return samples >= 8 && light / samples >= 0.52;
 }
 
+export function isLikelyQrTextCluster(region: BubbleTextRegion & { confidence: number }) {
+  const aspectRatio = region.width / Math.max(1, region.height);
+  return region.confidence < 0.60 && aspectRatio >= 0.72 && aspectRatio <= 1.38 && region.width >= 80 && region.height >= 80;
+}
+
 /**
  * The learned model is helpful where a simple fill would damage a coloured or
  * dark bubble. Neutral white dialogue balloons are deliberately kept on the
@@ -373,9 +380,10 @@ function expandBinaryMask(mask: Uint8Array, width: number, height: number, passe
   return current;
 }
 
-export function buildTrainedInpaintMask(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
+export function buildTrainedInpaintMask(source: Buffer, width: number, height: number, regions: BubbleTextRegion[], detectorTextMask?: Buffer) {
   const mask = new Uint8Array(width * height);
   const read = (x: number, y: number): Pixel => { const o = (y * width + x) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
+  const detectorMaskAvailable = detectorTextMask?.length === width * height;
   for (const region of uniqueRegions(regions, 48)) {
     const background = regionBackground(source, width, height, region);
     const x0 = clamp(region.x, 1, width - 2); const y0 = clamp(region.y, 1, height - 2);
@@ -383,7 +391,12 @@ export function buildTrainedInpaintMask(source: Buffer, width: number, height: n
     for (let y = y0; y < y1; y += 1) for (let x = x0; x < x1; x += 1) {
       const pixel = read(x, y);
       const brightDifference = Math.abs(brightness(pixel) - brightness(background));
-      if (pixel[3] > 180 && (colorDistance(pixel, background) > 48 || brightDifference > 38)) mask[y * width + x] = 255;
+      const segmentedText = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
+      const contrastsWithBackdrop = pixel[3] > 180 && (colorDistance(pixel, background) > 48 || brightDifference > 38);
+      // seg can surround an entire low-resolution text block. It helps recover soft outlines only when the pixel
+      // still differs from its immediate bubble background; it must never turn a smooth coloured fill into a mask.
+      const likelyTextEdge = segmentedText && pixel[3] > 180 && (colorDistance(pixel, background) > 22 || brightDifference > 18);
+      if (contrastsWithBackdrop || likelyTextEdge) mask[y * width + x] = 255;
     }
   }
   return expandBinaryMask(mask, width, height, 3);
@@ -395,8 +408,8 @@ function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: nu
   return output;
 }
 
-async function inpaintWithTrainedModel(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
-  let output = Buffer.from(source); const globalMask = buildTrainedInpaintMask(source, width, height, regions); let repairedRegions = 0;
+async function inpaintWithTrainedModel(source: Buffer, width: number, height: number, regions: BubbleTextRegion[], detectorTextMask?: Buffer) {
+  let output = Buffer.from(source); const globalMask = buildTrainedInpaintMask(source, width, height, regions, detectorTextMask); let repairedRegions = 0;
   for (const region of uniqueRegions(regions, 48)) {
     const padding = clamp(Math.round(Math.max(region.width, region.height) * 0.35), 32, 128);
     const left = clamp(region.x - padding, 0, width - 1); const top = clamp(region.y - padding, 0, height - 1);
@@ -452,15 +465,24 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     await input.onTile?.({ tileIndex, tileCount, status: "detecting" });
     // The local detector is intentionally restricted to neutral bubbles: the wider coloured-backdrop fallback matched artwork in the retained chapter.
     const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, false, profile.maxRegionsPerTile, true);
-    const comicRegions = profile.useTrainedInpainting ? await requestLocalComicTextDetection(visionInput) : undefined;
+    const comicDetection = profile.useTrainedInpainting ? await requestLocalComicTextDetectionWithMask(visionInput) : undefined;
+    const comicRegions = comicDetection?.regions;
     const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
-    const comicBubbleRegions = (comicRegions ?? []).flatMap(({ confidence: _confidence, ...region }) => {
+    const comicBubbleRegions = (comicRegions ?? []).flatMap(({ confidence, ...region }) => {
       const valid = region.x >= 0 && region.y >= 0 && region.x + region.width <= width && region.y + region.height <= currentHeight;
-      const lightBubbleFill = inferLightBubbleFill(tileData, width, currentHeight, region);
       const insideNeutralBubble = comicNeutralBubbles && isInsideNeutralBubble(region, comicNeutralBubbles.areas, comicNeutralBubbles.labels, width, currentHeight);
-      return valid && Boolean(lightBubbleFill) && Boolean(insideNeutralBubble) && hasLikelyClosedBubbleOutline(tileData, width, currentHeight, region) ? [region] : [];
+      const hasNeutralInterior = Boolean(insideNeutralBubble) || hasNeutralLightBubbleInterior(tileData, width, currentHeight, region);
+      const smoothBubbleFill = hasSmoothBubbleBackdrop(tileData, width, currentHeight, region);
+      const closedOutline = hasLikelyClosedBubbleOutline(tileData, width, currentHeight, region);
+      // The retained full-page test exposed a QR card as a low-confidence, nearly square white "bubble".
+      // A genuine dialogue block may be square, but the detector assigns it materially higher confidence on these pages.
+      const likelyQrCode = isLikelyQrTextCluster({ ...region, confidence });
+      // ONNX detects the red/black/gradient balloons, but the previous neutral-only gate discarded them before Big-LaMa could repair them.
+      // White connected interiors certify an enclosed, potentially curved balloon. Coloured balloons have no such
+      // reliable component, so they remain restricted to the closed-outline plus smooth-backdrop path.
+      return valid && !likelyQrCode && ((hasNeutralInterior && (closedOutline || smoothBubbleFill)) || (closedOutline && smoothBubbleFill)) ? [region] : [];
     });
-    const remote = profile.useRemoteWhenLocalMisses && comicRegions === undefined && !remoteDetectionUnavailable
+    const remote = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable
       ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).catch((error) => {
         console.warn("[cleaner] remote detection skipped for one tile", error instanceof Error ? error.message : error);
         remoteDetectionUnavailable = true;
@@ -468,12 +490,15 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       })
       : [];
     if (remote.length) remoteDetectionTiles += 1;
-    const detected = comicBubbleRegions.length ? uniqueRegions([...comicBubbleRegions, ...local], profile.maxRegionsPerTile) : remote.length ? uniqueRegions([...remote, ...local], profile.maxRegionsPerTile) : uniqueRegions(local, profile.maxRegionsPerTile); detectedRegions += detected.length;
+    const detected = remote.length
+      ? uniqueRegions([...remote, ...comicBubbleRegions, ...local], profile.maxRegionsPerTile)
+      : comicBubbleRegions.length ? uniqueRegions([...comicBubbleRegions, ...local], profile.maxRegionsPerTile)
+        : uniqueRegions(local, profile.maxRegionsPerTile); detectedRegions += detected.length;
     const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)], 48);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
-    const localRegions = profile.useTrainedInpainting ? regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : regions;
-    const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
-    const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions) : undefined;
+    const localRegions = !profile.useTrainedInpainting ? regions : profile.trainedOnly ? [] : regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region));
+    const trainedRegions = profile.useTrainedInpainting ? profile.trainedOnly ? regions : regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
+    const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions, comicDetection?.textMask) : undefined;
     const trainedOutput = trained?.repairedRegions ? trained.output : tileData;
     const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions);
     trainedInpaintRegions += trained?.repairedRegions ?? 0;

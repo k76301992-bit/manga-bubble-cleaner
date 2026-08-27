@@ -20,4 +20,4 @@ afterAll(async () => {
   const client = await MongoClient.connect(uri);
   await client.db(process.env.MONGODB_DB_NAME || "manga_bubble_cleaner").collection("processing_jobs").deleteOne({ id: testId });
   await client.close();
-});
+}, 35_000);
