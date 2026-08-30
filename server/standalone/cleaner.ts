@@ -115,6 +115,20 @@ function findNeutralBubbleAreas(source: Buffer, width: number, height: number) {
   return { labels, areas };
 }
 
+function splitRegionAcrossNeutralBubbles(region: BubbleTextRegion, areas: NeutralBubbleArea[]) {
+  const overlaps = areas.filter((area) => {
+    const overlapWidth = Math.max(0, Math.min(region.x + region.width, area.x + area.width) - Math.max(region.x, area.x));
+    const overlapHeight = Math.max(0, Math.min(region.y + region.height, area.y + area.height) - Math.max(region.y, area.y));
+    return overlapWidth * overlapHeight >= Math.max(24, region.width * region.height * 0.04);
+  });
+  if (overlaps.length < 2) return [region];
+  return overlaps.map((area) => {
+    const left = Math.max(region.x, area.x + 2); const top = Math.max(region.y, area.y + 2);
+    const right = Math.min(region.x + region.width, area.x + area.width - 2); const bottom = Math.min(region.y + region.height, area.y + area.height - 2);
+    return right - left >= 8 && bottom - top >= 8 ? { x: left, y: top, width: right - left, height: bottom - top } : undefined;
+  }).filter((item): item is BubbleTextRegion => Boolean(item));
+}
+
 function isInsideNeutralBubble(region: BubbleTextRegion, areas: NeutralBubbleArea[], labels: Int32Array, width: number, height: number) {
   const centerX = Math.round(region.x + region.width / 2); const centerY = Math.round(region.y + region.height / 2);
   return areas.some((area) => {
@@ -317,7 +331,7 @@ export function shouldUseLocalBubbleRepair(source: Buffer, width: number, height
   return brightness(fill) >= 205 && chroma <= 32;
 }
 
-export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: number, regions: BubbleTextRegion[]) {
+export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: number, regions: BubbleTextRegion[], detectorTextMask?: Buffer) {
   const output = Buffer.from(source);
   const read = (x: number, y: number): Pixel => { const o = (y * width + x) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
   const write = (x: number, y: number, c: Pixel) => { const o = (y * width + x) * 4; output[o] = Math.round(c[0]); output[o + 1] = Math.round(c[1]); output[o + 2] = Math.round(c[2]); output[o + 3] = source[o + 3]; };
@@ -325,6 +339,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     const samples: Pixel[] = []; for (let offset = -2; offset <= 2; offset += 1) samples.push(direction === "x" ? read(clamp(x + offset, 0, width - 1), y) : read(x, clamp(y + offset, 0, height - 1)));
     return [samples.reduce((sum, c) => sum + c[0], 0) / 5, samples.reduce((sum, c) => sum + c[1], 0) / 5, samples.reduce((sum, c) => sum + c[2], 0) / 5, 255];
   };
+  const detectorMaskAvailable = detectorTextMask?.length === width * height;
   for (const region of uniqueRegions(regions, 48)) {
     const lightFill = inferLightBubbleFill(source, width, height, region);
     const smooth = !lightFill && hasSmoothBubbleBackdrop(source, width, height, region);
@@ -340,7 +355,12 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     const boxWidth = x1 - x0 + 1; const boxHeight = y1 - y0 + 1; const mask = new Uint8Array(boxWidth * boxHeight);
     for (let y = y0 + 1; y < y1; y += 1) for (let x = x0 + 1; x < x1; x += 1) {
       const expected = backdropAt(x, y);
-      const isContrasting = colorDistance(read(x, y), expected) > (lightFill ? 22 : 50);
+      const pixel = read(x, y);
+      const detectorPixel = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
+      // For local balloon repair, the learned segmentation is the safety boundary.
+      // Do not infer extra pixels: that can erase the balloon outline or a nearby face.
+      if (detectorMaskAvailable && !detectorPixel) continue;
+      const isContrasting = colorDistance(pixel, expected) > (lightFill ? 16 : 50);
       if (!isContrasting) continue;
       if (lightFill) {
         mask[(y - y0) * boxWidth + x - x0] = 1;
@@ -353,7 +373,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
       if (backgroundNeighbours >= 5) mask[(y - y0) * boxWidth + x - x0] = 1;
     }
     const expanded = new Uint8Array(mask);
-    for (let pass = 0; pass < (lightFill ? 5 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
+    for (let pass = 0; pass < (detectorMaskAvailable ? 0 : lightFill ? 5 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) if (expanded[(y - y0) * boxWidth + x - x0]) write(x, y, backdropAt(x, y));
   }
   return output;
@@ -394,13 +414,13 @@ export function buildTrainedInpaintMask(source: Buffer, width: number, height: n
       const brightDifference = Math.abs(brightness(pixel) - brightness(background));
       const segmentedText = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
       const contrastsWithBackdrop = pixel[3] > 180 && (colorDistance(pixel, background) > 48 || brightDifference > 38);
-      // seg can surround an entire low-resolution text block. It helps recover soft outlines only when the pixel
-      // still differs from its immediate bubble background; it must never turn a smooth coloured fill into a mask.
-      const likelyTextEdge = segmentedText && pixel[3] > 180 && (colorDistance(pixel, background) > 22 || brightDifference > 18);
-      if (contrastsWithBackdrop || likelyTextEdge) mask[y * width + x] = 255;
+      // When ONNX supplies a mask, never let a broad box erase a nearby face or artwork.
+      // Without it, retain the conservative contrast fallback for remote/manual regions.
+      const likelyTextEdge = segmentedText && pixel[3] > 180 && (colorDistance(pixel, background) > 12 || brightDifference > 10);
+      if ((detectorMaskAvailable ? likelyTextEdge : contrastsWithBackdrop) && pixel[3] > 180) mask[y * width + x] = 255;
     }
   }
-  return expandBinaryMask(mask, width, height, 3);
+  return expandBinaryMask(mask, width, height, detectorMaskAvailable ? 1 : 3);
 }
 
 function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: number, top: number, cropWidth: number, cropHeight: number) {
@@ -482,7 +502,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       // ONNX is a text detector, not a bubble-colour classifier. Trust valid detector boxes for
       // white, coloured, gradient and semi-transparent balloons alike; only suppress the known
       // low-confidence square QR false positive.
-      return valid && !likelyQrCode ? [region] : [];
+      if (!valid || likelyQrCode) return [];
+      // Keep a connected/overlapping balloon as one semantic region. The detector mask
+      // below separates its text lines without drawing an artificial rectangle through it.
+      return [region];
     });
     const remote = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable
       ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).catch((error) => {
@@ -504,7 +527,7 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
     const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions, comicDetection?.textMask) : undefined;
     const trainedOutput = trained?.repairedRegions ? trained.output : tileData;
-    const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions);
+    const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions, comicDetection?.textMask);
     trainedInpaintRegions += trained?.repairedRegions ?? 0;
     const sourceStart = (coreTop - top) * rowBytes;
     repairedRaw.copy(output, coreTop * rowBytes, sourceStart, sourceStart + coreHeight * rowBytes);
