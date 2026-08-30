@@ -325,7 +325,7 @@ export function isLikelyQrTextCluster(region: BubbleTextRegion & { confidence: n
  * observed on otherwise flat white paper.
  */
 export function shouldUseLocalBubbleRepair(source: Buffer, width: number, height: number, region: BubbleTextRegion) {
-  const fill = inferLightBubbleFill(source, width, height, region);
+  const fill = inferLightBubbleFill(source, width, height, region) ?? (hasNeutralLightBubbleInterior(source, width, height, region) ? [246, 246, 246, 255] as Pixel : undefined);
   if (!fill) return false;
   const chroma = Math.max(fill[0], fill[1], fill[2]) - Math.min(fill[0], fill[1], fill[2]);
   return brightness(fill) >= 205 && chroma <= 32;
@@ -342,6 +342,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
   const detectorMaskAvailable = detectorTextMask?.length === width * height;
   for (const region of uniqueRegions(regions, 48)) {
     const lightFill = inferLightBubbleFill(source, width, height, region);
+    const fill: Pixel = lightFill ?? [246, 246, 246, 255];
     const smooth = !lightFill && hasSmoothBubbleBackdrop(source, width, height, region);
     if (!lightFill && !smooth) continue;
     const layerPadding = lightFill ? clamp(Math.round(Math.min(region.width, region.height) * 0.12), 6, 16) : clamp(Math.round(Math.min(region.width, region.height) * 0.14), 7, 14);
@@ -359,13 +360,21 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
       const detectorPixel = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
       // For local balloon repair, the learned segmentation is the safety boundary.
       // Do not infer extra pixels: that can erase the balloon outline or a nearby face.
-      if (detectorMaskAvailable && !detectorPixel) continue;
-      const isContrasting = colorDistance(pixel, expected) > (lightFill ? 16 : 50);
-      if (!isContrasting) continue;
+      if (detectorMaskAvailable && !detectorPixel && !lightFill) continue;
+      const isContrasting = colorDistance(pixel, expected) > (lightFill ? 6 : 50);
       if (lightFill) {
+        let whiteNeighbours = 0;
+        for (let dy = -2; dy <= 2; dy += 1) for (let dx = -2; dx <= 2; dx += 1) {
+          if (!dx && !dy) continue;
+          const neighbour = read(clamp(x + dx, 0, width - 1), clamp(y + dy, 0, height - 1));
+          const neighbourChroma = Math.max(neighbour[0], neighbour[1], neighbour[2]) - Math.min(neighbour[0], neighbour[1], neighbour[2]);
+          if (brightness(neighbour) >= 222 && neighbourChroma <= 58) whiteNeighbours += 1;
+        }
+        if (whiteNeighbours < 5 || !isContrasting) continue;
         mask[(y - y0) * boxWidth + x - x0] = 1;
         continue;
       }
+      if (!isContrasting) continue;
       let backgroundNeighbours = 0;
       for (const [dx, dy] of [[-3, 0], [3, 0], [0, -3], [0, 3], [-3, -3], [3, -3], [-3, 3], [3, 3]]) {
         if (colorDistance(read(clamp(x + dx, 0, width - 1), clamp(y + dy, 0, height - 1)), backdropAt(clamp(x + dx, x0, x1), clamp(y + dy, y0, y1))) < (lightFill ? 62 : 56)) backgroundNeighbours += 1;
@@ -374,7 +383,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     }
     const expanded = new Uint8Array(mask);
     for (let pass = 0; pass < (detectorMaskAvailable ? 0 : lightFill ? 5 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
-    for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) if (expanded[(y - y0) * boxWidth + x - x0]) write(x, y, backdropAt(x, y));
+    for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) if (expanded[(y - y0) * boxWidth + x - x0]) write(x, y, lightFill ? fill : backdropAt(x, y));
   }
   return output;
 }
