@@ -46,7 +46,7 @@ async function requestComicTextDetection(image: Buffer, includeTextMask: boolean
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     console.warn("[inference] local comic text detection failed", detail);
-    if (process.env.TEXT_DETECTOR_STRICT?.trim().toLowerCase() !== "false") {
+    if (process.env.TEXT_DETECTOR_STRICT?.trim().toLowerCase() === "true") {
       throw new Error(`كاشف النص المحلي غير متاح: ${detail}`);
     }
     return undefined;

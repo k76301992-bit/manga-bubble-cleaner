@@ -496,8 +496,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
         : uniqueRegions(local, profile.maxRegionsPerTile); detectedRegions += detected.length;
     const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)], 48);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
-    const localRegions = !profile.useTrainedInpainting ? regions : profile.trainedOnly ? [] : regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region));
-    const trainedRegions = profile.useTrainedInpainting ? profile.trainedOnly ? regions : regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
+    // Keep flat white balloons on the deterministic local path even in maximum-detail.
+    // If the learned detector/inpainting service is unavailable, this still produces a useful result.
+    const localRegions = !profile.useTrainedInpainting ? regions : regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region));
+    const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
     const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions, comicDetection?.textMask) : undefined;
     const trainedOutput = trained?.repairedRegions ? trained.output : tileData;
     const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions);
