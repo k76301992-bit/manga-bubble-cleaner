@@ -357,12 +357,10 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
       const expected = backdropAt(x, y);
       const pixel = read(x, y);
       const detectorPixel = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
-      // Recover faint anti-aliased Korean glyph pixels only inside the detector box.
-      // Never run this fallback in the padding area, where a nearby face or outline may exist.
-      const insideTextBox = x >= region.x && x < region.x + region.width && y >= region.y && y < region.y + region.height;
-      const localFaintText = Boolean(lightFill) && insideTextBox && brightness(pixel) < brightness(expected) - 18;
-      if (detectorMaskAvailable && !detectorPixel && !localFaintText) continue;
-      const isContrasting = colorDistance(pixel, expected) > (lightFill ? 16 : 50) || localFaintText;
+      // For local balloon repair, the learned segmentation is the safety boundary.
+      // Do not infer extra pixels: that can erase the balloon outline or a nearby face.
+      if (detectorMaskAvailable && !detectorPixel) continue;
+      const isContrasting = colorDistance(pixel, expected) > (lightFill ? 16 : 50);
       if (!isContrasting) continue;
       if (lightFill) {
         mask[(y - y0) * boxWidth + x - x0] = 1;
