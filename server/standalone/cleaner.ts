@@ -10,8 +10,8 @@ const MAX_WIDTH = 12000;
 const MAX_HEIGHT = 30000;
 export const TILE_HEIGHT = 3200;
 const TILE_OVERLAP = 56;
-const EXTERNAL_QWEN_BASE_URL = process.env.EXTERNAL_QWEN_BASE_URL || "https://ggg-production-739f.up.railway.app/v1";
-const EXTERNAL_QWEN_MODEL = process.env.EXTERNAL_QWEN_MODEL || "qwen";
+const EXTERNAL_QWEN_BASE_URL = process.env.EXTERNAL_QWEN_BASE_URL || process.env.EXTERNAL_OPENAI_BASE_URL || "https://ggg-production-739f.up.railway.app/v1";
+const EXTERNAL_QWEN_MODEL = process.env.EXTERNAL_QWEN_MODEL || process.env.EXTERNAL_OPENAI_MODEL || "qwen";
 const SUPPORTED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
@@ -218,7 +218,7 @@ export function parseQwenBubbleRegions(raw: string, width: number, height: numbe
 }
 
 async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, height: number, requestTimeoutMs: number, maximumRegions: number) {
-  const apiKey = process.env.EXTERNAL_OPENAI_API_KEY;
+  const apiKey = process.env.EXTERNAL_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("مفتاح موفر كشف النص غير مضبوط.");
   if (imageBuffer.length > MAX_INPUT_BYTES) throw new Error("مقطع الصورة أكبر من حد موفر كشف النص.");
   const prompt = `Inspect this ${width}x${height} manhwa crop. Return one JSON object only: {"coordinate_space":"pixels","regions":[{"kind":"dialogue"|"caption","bbox_2d":[ymin,xmin,ymax,xmax],"text":"optional"}]}. Find every readable dialogue or narration text group inside a closed speech bubble or caption box, including white, yellow, red, black, translucent, patterned, or gradient fills. Each bbox must be TIGHT around visible text ink, including fill, outline, glow, and shadow, but never include the bubble border, tail, or empty bubble background. Ignore logos, sound effects, panel borders, and all lettering outside closed bubbles. Use exact pixel coordinates for this supplied image. If there is no eligible text, return {"coordinate_space":"pixels","regions":[]}.`;

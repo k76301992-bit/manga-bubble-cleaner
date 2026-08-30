@@ -44,7 +44,11 @@ async function requestComicTextDetection(image: Buffer, includeTextMask: boolean
     const textMask = encodedTextMask ? await sharp(encodedTextMask).greyscale().raw().toBuffer() : undefined;
     return { regions, textMask };
   } catch (error) {
-    console.warn("[inference] local comic text detection skipped", error instanceof Error ? error.message : error);
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn("[inference] local comic text detection failed", detail);
+    if (process.env.TEXT_DETECTOR_STRICT?.trim().toLowerCase() !== "false") {
+      throw new Error(`كاشف النص المحلي غير متاح: ${detail}`);
+    }
     return undefined;
   }
 }

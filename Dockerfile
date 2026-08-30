@@ -4,6 +4,8 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends python3 pyt
 RUN python3 -m venv /opt/inference-venv
 ENV PATH="/opt/inference-venv/bin:${PATH}" \
     NODE_ENV=production \
+    PYTHONUNBUFFERED=1 \
+    TEXT_DETECTOR_ENABLED=true \
     ANIME_LAMA_MODEL_PATH=/app/models/anime-manga-big-lama.pt \
     COMIC_TEXT_DETECTOR_PATH=/app/models/comictextdetector.pt.onnx
 
@@ -17,7 +19,8 @@ RUN mkdir -p /app/models \
  && echo "1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f  /app/models/comictextdetector.pt.onnx" | sha256sum -c -
 
 COPY package.json pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile --prod=false
+RUN npm install --global pnpm@9.12.0 --no-fund --no-audit \
+ && pnpm install --frozen-lockfile --prod=false
 COPY . .
 RUN pnpm build && chmod +x scripts/start-standalone.sh
 

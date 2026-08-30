@@ -200,6 +200,14 @@ text_detector = ComicTextDetector()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     engine.load()
+    detector_required = os.environ.get("TEXT_DETECTOR_ENABLED", "true").strip().lower() != "false"
+    if detector_required:
+        try:
+            text_detector.load()
+        except Exception as error:
+            # Keep the process alive so /health exposes the real readiness state;
+            # the production launcher will refuse to start Node until this is fixed.
+            print(f"[inference] Comic text detector unavailable at startup: {error}", flush=True)
     yield
 
 
@@ -208,7 +216,9 @@ app = FastAPI(title="Manga Bubble Cleaner Inference", docs_url=None, redoc_url=N
 
 @app.get("/health")
 def health():
-    return {"ok": engine.model is not None, "model": "anime-manga-big-lama", "loadTimeMs": engine.load_time_ms, "textDetectorReady": text_detector.net is not None, "imagesPersisted": False}
+    detector_required = os.environ.get("TEXT_DETECTOR_ENABLED", "true").strip().lower() != "false"
+    detector_ready = text_detector.net is not None
+    return {"ok": engine.model is not None and (detector_ready or not detector_required), "model": "anime-manga-big-lama", "loadTimeMs": engine.load_time_ms, "textDetectorReady": detector_ready, "imagesPersisted": False}
 
 
 @app.post("/v1/inpaint")
