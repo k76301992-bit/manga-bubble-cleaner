@@ -344,7 +344,11 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     const lightFill = inferLightBubbleFill(source, width, height, region);
     const fill: Pixel = lightFill ?? [246, 246, 246, 255];
     const smooth = !lightFill && hasSmoothBubbleBackdrop(source, width, height, region);
-    if (!lightFill && !smooth) continue;
+    // A valid ONNX text region is enough to attempt a conservative local
+    // repair even when the balloon is coloured/transparent and cannot be
+    // classified as a flat light or smooth backdrop. The pixel mask below
+    // remains mandatory, so this never turns the whole box into a fill.
+    if (!lightFill && !smooth && !detectorMaskAvailable) continue;
     const layerPadding = lightFill ? clamp(Math.round(Math.min(region.width, region.height) * 0.12), 6, 16) : clamp(Math.round(Math.min(region.width, region.height) * 0.14), 7, 14);
     const x0 = clamp(region.x - layerPadding, 6, width - 7); const y0 = clamp(region.y - layerPadding, 6, height - 7); const x1 = clamp(region.x + region.width + layerPadding, x0 + 1, width - 7); const y1 = clamp(region.y + region.height + layerPadding, y0 + 1, height - 7);
     const backdropAt = (x: number, y: number) => {
@@ -357,10 +361,27 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     for (let y = y0 + 1; y < y1; y += 1) for (let x = x0 + 1; x < x1; x += 1) {
       const expected = backdropAt(x, y);
       const pixel = read(x, y);
-      const detectorPixel = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
+      let detectorPixel = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
+      // Recover anti-aliased glyph edges with a tiny two-pixel dilation, but
+      // only while staying inside the light-bubble repair box. This is much
+      // narrower than expanding the whole bubble and cannot reach a face.
+      if (!detectorPixel && detectorMaskAvailable && lightFill) {
+        for (let dy = -4; dy <= 4 && !detectorPixel; dy += 1) for (let dx = -4; dx <= 4; dx += 1) {
+          if (detectorTextMask![(clamp(y + dy, 0, height - 1) * width) + clamp(x + dx, 0, width - 1)] > 0) { detectorPixel = true; break; }
+        }
+      }
       // For local balloon repair, the learned segmentation is the safety boundary.
       // Do not infer extra pixels: that can erase the balloon outline or a nearby face.
-      if (detectorMaskAvailable && !detectorPixel && !lightFill) continue;
+      // This detector-pixel path also handles coloured/transparent balloons,
+      // whose backdrop cannot pass the flat-white classification checks.
+      if (detectorMaskAvailable && detectorPixel && brightness(pixel) < 235 && colorDistance(pixel, expected) > 3) {
+        mask[(y - y0) * boxWidth + x - x0] = 1;
+        continue;
+      }
+      // When ONNX supplies a pixel mask, it is the hard safety boundary for
+      // every bubble type, including neutral/light balloons. A detector box
+      // alone must never be allowed to erase a nearby face.
+      if (detectorMaskAvailable && !detectorPixel) continue;
       const isContrasting = colorDistance(pixel, expected) > (lightFill ? 6 : 50);
       if (lightFill) {
         let whiteNeighbours = 0;
@@ -370,8 +391,18 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
           const neighbourChroma = Math.max(neighbour[0], neighbour[1], neighbour[2]) - Math.min(neighbour[0], neighbour[1], neighbour[2]);
           if (brightness(neighbour) >= 222 && neighbourChroma <= 58) whiteNeighbours += 1;
         }
-        if (whiteNeighbours < 5 || !isContrasting) continue;
+        // With a valid ONNX pixel mask, the mask itself is the hard safety
+        // boundary, so remove dark/anti-aliased glyph pixels even when their
+        // neighbours are not white. Without that mask keep the old strict
+        // white-neighbour guard to protect faces and artwork.
+        if (detectorMaskAvailable) {
+          if (!detectorPixel || brightness(pixel) >= 245 || (lightFill && colorDistance(pixel, lightFill) > 62)) continue;
+        } else if (whiteNeighbours < 5 || !isContrasting) continue;
         mask[(y - y0) * boxWidth + x - x0] = 1;
+        continue;
+      }
+      if (detectorMaskAvailable && detectorPixel) {
+        if (brightness(pixel) < 245 && colorDistance(pixel, expected) > 5) mask[(y - y0) * boxWidth + x - x0] = 1;
         continue;
       }
       if (!isContrasting) continue;
@@ -382,8 +413,11 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
       if (backgroundNeighbours >= 5) mask[(y - y0) * boxWidth + x - x0] = 1;
     }
     const expanded = new Uint8Array(mask);
-    for (let pass = 0; pass < (detectorMaskAvailable ? 0 : lightFill ? 5 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
-    for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) if (expanded[(y - y0) * boxWidth + x - x0]) write(x, y, lightFill ? fill : backdropAt(x, y));
+    for (let pass = 0; pass < (lightFill ? 0 : detectorMaskAvailable ? 0 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
+    // Reconstruct from the local background for every bubble type. A fixed
+    // white fill is only valid for neutral paper; on pink/transparent bubbles
+    // it creates a visible rectangle even when the mask is text-only.
+    for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) if (expanded[(y - y0) * boxWidth + x - x0]) write(x, y, backdropAt(x, y));
   }
   return output;
 }
@@ -502,6 +536,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
     const comicRegions = comicDetection?.regions;
     const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
+    // Use only the model's text mask here. The earlier connected-component
+    // augmentation could classify a bright face-adjacent region as balloon
+    // interior and erase artwork; it is intentionally disabled.
+    const safeComicTextMask = comicDetection?.textMask ? Buffer.from(comicDetection.textMask) : Buffer.alloc(width * currentHeight);
     const comicBubbleRegions = (comicRegions ?? []).flatMap(({ confidence, ...region }) => {
       const valid = region.x >= 0 && region.y >= 0 && region.x + region.width <= width && region.y + region.height <= currentHeight;
       const insideNeutralBubble = comicNeutralBubbles && isInsideNeutralBubble(region, comicNeutralBubbles.areas, comicNeutralBubbles.labels, width, currentHeight);
@@ -515,8 +553,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       // white, coloured, gradient and semi-transparent balloons alike; only suppress the known
       // low-confidence square QR false positive.
       if (!valid || likelyQrCode) return [];
-      // Keep a connected/overlapping balloon as one semantic region. The detector mask
-      // below separates its text lines without drawing an artificial rectangle through it.
+      // Keep the detector's text box as the safety boundary. Expanding to the
+      // whole white connected component can include transparent gaps, sky, or a
+      // face when two balloons touch. Faint glyphs are recovered below by a
+      // one-pixel local dilation, never by enlarging this box.
       return [region];
     });
     const remote = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable
@@ -537,9 +577,9 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // If the learned detector/inpainting service is unavailable, this still produces a useful result.
     const localRegions = !profile.useTrainedInpainting ? regions : regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region));
     const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
-    const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions, comicDetection?.textMask) : undefined;
+    const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions, safeComicTextMask) : undefined;
     const trainedOutput = trained?.repairedRegions ? trained.output : tileData;
-    const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions, comicDetection?.textMask);
+    const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions, safeComicTextMask);
     trainedInpaintRegions += trained?.repairedRegions ?? 0;
     const sourceStart = (coreTop - top) * rowBytes;
     repairedRaw.copy(output, coreTop * rowBytes, sourceStart, sourceStart + coreHeight * rowBytes);
