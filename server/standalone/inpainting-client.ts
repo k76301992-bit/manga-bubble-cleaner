@@ -25,13 +25,25 @@ export async function requestTrainedInpainting(image: Buffer, mask: Buffer) {
 async function requestComicTextDetection(image: Buffer, includeTextMask: boolean): Promise<LocalComicTextDetection | undefined> {
   if (process.env.INFERENCE_ENABLED?.trim().toLowerCase() === "false" || process.env.TEXT_DETECTOR_ENABLED?.trim().toLowerCase() === "false") return undefined;
   try {
-    const response = await fetch(`${inferenceUrl()}/v1/detect-text`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(Number(process.env.TEXT_DETECTOR_TIMEOUT_MS || 12_000)),
-      body: JSON.stringify({ image: image.toString("base64"), includeTextMask }),
-    });
-    if (!response.ok) throw new Error(`text detector returned ${response.status}`);
+    const requestBody = JSON.stringify({ image: image.toString("base64"), includeTextMask });
+    let response: Response | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        response = await fetch(`${inferenceUrl()}/v1/detect-text`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(Number(process.env.TEXT_DETECTOR_TIMEOUT_MS || 12_000)),
+          body: requestBody,
+        });
+        if (response.ok) break;
+        lastError = new Error(`text detector returned ${response.status}`);
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+    if (!response?.ok) throw lastError instanceof Error ? lastError : new Error("text detector request failed");
     const payload = await response.json() as { regions?: unknown; textMask?: unknown };
     if (!Array.isArray(payload.regions)) throw new Error("text detector response has no regions");
     const regions = payload.regions.flatMap((region) => {

@@ -329,17 +329,18 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
     const lightFill = inferLightBubbleFill(source, width, height, region);
     const smooth = !lightFill && hasSmoothBubbleBackdrop(source, width, height, region);
     if (!lightFill && !smooth) continue;
-    const layerPadding = lightFill ? 3 : clamp(Math.round(Math.min(region.width, region.height) * 0.14), 7, 14);
+    const layerPadding = lightFill ? clamp(Math.round(Math.min(region.width, region.height) * 0.12), 6, 16) : clamp(Math.round(Math.min(region.width, region.height) * 0.14), 7, 14);
     const x0 = clamp(region.x - layerPadding, 6, width - 7); const y0 = clamp(region.y - layerPadding, 6, height - 7); const x1 = clamp(region.x + region.width + layerPadding, x0 + 1, width - 7); const y1 = clamp(region.y + region.height + layerPadding, y0 + 1, height - 7);
     const backdropAt = (x: number, y: number) => {
-      if (lightFill) return lightFill;
       const horizontal = mix(averageAt(x0 - 4, y, "y"), averageAt(x1 + 4, y, "y"), (x - x0) / Math.max(1, x1 - x0));
-      return horizontal;
+      // A constant white fill creates a visible rectangle on the subtle grey gradient
+      // inside large balloons. Blend the inferred fill with nearby pixels instead.
+      return lightFill ? mix(horizontal, lightFill, 0.28) : horizontal;
     };
     const boxWidth = x1 - x0 + 1; const boxHeight = y1 - y0 + 1; const mask = new Uint8Array(boxWidth * boxHeight);
     for (let y = y0 + 1; y < y1; y += 1) for (let x = x0 + 1; x < x1; x += 1) {
       const expected = backdropAt(x, y);
-      const isContrasting = colorDistance(read(x, y), expected) > (lightFill ? 38 : 50);
+      const isContrasting = colorDistance(read(x, y), expected) > (lightFill ? 22 : 50);
       if (!isContrasting) continue;
       if (lightFill) {
         mask[(y - y0) * boxWidth + x - x0] = 1;
@@ -352,7 +353,7 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
       if (backgroundNeighbours >= 5) mask[(y - y0) * boxWidth + x - x0] = 1;
     }
     const expanded = new Uint8Array(mask);
-    for (let pass = 0; pass < (lightFill ? 3 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
+    for (let pass = 0; pass < (lightFill ? 5 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
     for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) if (expanded[(y - y0) * boxWidth + x - x0]) write(x, y, backdropAt(x, y));
   }
   return output;
@@ -463,8 +464,9 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // Detection only: JPEG significantly reduces the remote request size while preserving tile coordinates.
     const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).jpeg({ quality: 92, chromaSubsampling: "4:4:4" }).toBuffer();
     await input.onTile?.({ tileIndex, tileCount, status: "detecting" });
-    // The local detector is intentionally restricted to neutral bubbles: the wider coloured-backdrop fallback matched artwork in the retained chapter.
-    const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, false, profile.maxRegionsPerTile, true);
+    // The fallback also considers smooth coloured/gradient balloons. The learned detector remains the
+    // primary source and is not gated by a white-background heuristic.
+    const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, true, profile.maxRegionsPerTile, false);
     const comicDetection = profile.useTrainedInpainting ? await requestLocalComicTextDetectionWithMask(visionInput) : undefined;
     const comicRegions = comicDetection?.regions;
     const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
@@ -477,10 +479,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       // The retained full-page test exposed a QR card as a low-confidence, nearly square white "bubble".
       // A genuine dialogue block may be square, but the detector assigns it materially higher confidence on these pages.
       const likelyQrCode = isLikelyQrTextCluster({ ...region, confidence });
-      // ONNX detects the red/black/gradient balloons, but the previous neutral-only gate discarded them before Big-LaMa could repair them.
-      // White connected interiors certify an enclosed, potentially curved balloon. Coloured balloons have no such
-      // reliable component, so they remain restricted to the closed-outline plus smooth-backdrop path.
-      return valid && !likelyQrCode && ((hasNeutralInterior && (closedOutline || smoothBubbleFill)) || (closedOutline && smoothBubbleFill)) ? [region] : [];
+      // ONNX is a text detector, not a bubble-colour classifier. Trust valid detector boxes for
+      // white, coloured, gradient and semi-transparent balloons alike; only suppress the known
+      // low-confidence square QR false positive.
+      return valid && !likelyQrCode ? [region] : [];
     });
     const remote = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable
       ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).catch((error) => {
