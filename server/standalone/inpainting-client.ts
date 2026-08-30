@@ -28,12 +28,16 @@ async function requestComicTextDetection(image: Buffer, includeTextMask: boolean
     const requestBody = JSON.stringify({ image: image.toString("base64"), includeTextMask });
     let response: Response | undefined;
     let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const detectorAttempts = Math.max(1, Number(process.env.TEXT_DETECTOR_RETRIES || 1));
+    for (let attempt = 0; attempt < detectorAttempts; attempt += 1) {
       try {
         response = await fetch(`${inferenceUrl()}/v1/detect-text`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: AbortSignal.timeout(Number(process.env.TEXT_DETECTOR_TIMEOUT_MS || 12_000)),
+          // ONNX scans several 2048px windows per tile on Railway CPU. A 12s
+          // timeout aborts a healthy request and the retry then piles another
+          // inference onto the sidecar lock. Keep one long request by default.
+          signal: AbortSignal.timeout(Number(process.env.TEXT_DETECTOR_TIMEOUT_MS || 180_000)),
           body: requestBody,
         });
         if (response.ok) break;
@@ -41,7 +45,7 @@ async function requestComicTextDetection(image: Buffer, includeTextMask: boolean
       } catch (error) {
         lastError = error;
       }
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      if (attempt + 1 < detectorAttempts) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
     }
     if (!response?.ok) throw lastError instanceof Error ? lastError : new Error("text detector request failed");
     const payload = await response.json() as { regions?: unknown; textMask?: unknown };
