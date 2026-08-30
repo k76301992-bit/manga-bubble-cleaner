@@ -496,7 +496,10 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // The fallback also considers smooth coloured/gradient balloons. The learned detector remains the
     // primary source and is not gated by a white-background heuristic.
     const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, true, profile.maxRegionsPerTile, false);
-    const comicDetection = profile.useTrainedInpainting ? await requestLocalComicTextDetectionWithMask(visionInput) : undefined;
+    // Always run the local ONNX detector. Speed mode previously skipped it and
+    // relied only on the dark-ink fallback, which can collapse a long-strip page
+    // to a single detected balloon. Big-LaMa remains disabled in speed mode.
+    const comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
     const comicRegions = comicDetection?.regions;
     const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
     const comicBubbleRegions = (comicRegions ?? []).flatMap(({ confidence, ...region }) => {
