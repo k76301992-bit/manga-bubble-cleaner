@@ -31,7 +31,7 @@ type CleaningProfile = {
 
 export function cleaningProfileFor(quality: CleaningQuality): CleaningProfile {
   if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useRemoteAlongsideLocal: false, useTrainedInpainting: false, trainedOnly: false };
-  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 15_000, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true };
+  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 180_000, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true };
   return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: false, useTrainedInpainting: true, trainedOnly: false };
 }
 
@@ -534,7 +534,15 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // Always run the local ONNX detector. Speed mode previously skipped it and
     // relied only on the dark-ink fallback, which can collapse a long-strip page
     // to a single detected balloon. Big-LaMa remains disabled in speed mode.
-    const comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
+    let comicDetection: Awaited<ReturnType<typeof requestLocalComicTextDetectionWithMask>>;
+    try {
+      comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
+    } catch (error) {
+      // Strict mode must not abort maximum-detail: it should activate the
+      // configured external detector when the local sidecar times out.
+      console.warn("[cleaner] local detector unavailable; trying external detector", error instanceof Error ? error.message : error);
+      comicDetection = undefined;
+    }
     const comicRegions = comicDetection?.regions;
     const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
     // Use only the model's text mask here. The earlier connected-component
