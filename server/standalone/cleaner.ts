@@ -520,7 +520,9 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
   const decoded = await sharp(input.image).ensureAlpha().raw().toBuffer();
   const output = Buffer.from(decoded);
   const rowBytes = width * 4;
-  const tileCount = Math.ceil(height / profile.tileHeight); let detectedRegions = 0; let remoteDetectionTiles = 0; let trainedInpaintRegions = 0; let remoteDetectionUnavailable = false;
+  const tileCount = Math.ceil(height / profile.tileHeight); let detectedRegions = 0; let remoteDetectionTiles = 0; let trainedInpaintRegions = 0;   let remoteDetectionUnavailable = false;
+  let localDetectorUnavailable = false;
+
   for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
     const coreTop = tileIndex * profile.tileHeight; const coreHeight = Math.min(profile.tileHeight, height - coreTop);
     const top = Math.max(0, coreTop - TILE_OVERLAP); const bottom = Math.min(height, coreTop + coreHeight + TILE_OVERLAP); const currentHeight = bottom - top;
@@ -535,13 +537,19 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // relied only on the dark-ink fallback, which can collapse a long-strip page
     // to a single detected balloon. Big-LaMa remains disabled in speed mode.
     let comicDetection: Awaited<ReturnType<typeof requestLocalComicTextDetectionWithMask>>;
-    try {
-      comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
-    } catch (error) {
-      // Strict mode must not abort maximum-detail: it should activate the
-      // configured external detector when the local sidecar times out.
-      console.warn("[cleaner] local detector unavailable; trying external detector", error instanceof Error ? error.message : error);
+    if (localDetectorUnavailable) {
       comicDetection = undefined;
+      console.warn(`[cleaner] local detector disabled for tile ${tileIndex + 1}/${tileCount}; using external detector`);
+    } else {
+      try {
+        comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
+      } catch (error) {
+        // Do not retry a dead/slow sidecar on every tile. Mark it unavailable
+        // for this job so maximum-detail can proceed with the external path.
+        localDetectorUnavailable = true;
+        console.warn(`[cleaner] local detector unavailable on tile ${tileIndex + 1}/${tileCount}; using external detector`, error instanceof Error ? error.message : error);
+        comicDetection = undefined;
+      }
     }
     const comicRegions = comicDetection?.regions;
     const comicNeutralBubbles = comicRegions?.length ? findNeutralBubbleAreas(tileData, width, currentHeight) : undefined;
@@ -568,8 +576,13 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       // one-pixel local dilation, never by enlarging this box.
       return [region];
     });
-    const remote = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable
-      ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).catch((error) => {
+    const shouldUseExternalDetector = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable;
+    if (shouldUseExternalDetector) console.info(`[cleaner] external detector start tile ${tileIndex + 1}/${tileCount}`);
+    const remote = shouldUseExternalDetector
+      ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).then((result) => {
+        console.info(`[cleaner] external detector finished tile ${tileIndex + 1}/${tileCount}: ${result.length} regions`);
+        return result;
+      }).catch((error) => {
         console.warn("[cleaner] remote detection skipped for one tile", error instanceof Error ? error.message : error);
         remoteDetectionUnavailable = true;
         return [] as BubbleTextRegion[];
