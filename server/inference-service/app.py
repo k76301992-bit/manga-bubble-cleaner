@@ -138,6 +138,8 @@ class ComicTextDetector:
         if include_text_mask:
             seg = np.asarray(outputs[2], dtype=np.float32)[0, 0, :resized_height, :resized_width]
             text_mask = (cv2.resize(seg, (source.shape[1], source.shape[0]), interpolation=cv2.INTER_LINEAR) >= 0.30).astype(np.uint8) * 255
+        detect_threshold = float(os.environ.get("TEXT_DETECTOR_CONFIDENCE", "0.15"))
+        nms_threshold = float(os.environ.get("TEXT_DETECTOR_NMS", "0.35"))
         candidates: list[tuple[list[int], float, int]] = []
         for row in blocks:
             center_x, center_y, box_width, box_height, objectness = row[:5]
@@ -146,11 +148,11 @@ class ComicTextDetector:
                 continue
             class_id = int(np.argmax(classes))
             confidence = float(objectness * classes[class_id])
-            if confidence >= 0.40 and box_width >= 5 and box_height >= 5:
+            if confidence >= detect_threshold and box_width >= 5 and box_height >= 5:
                 candidates.append(([round(center_x - box_width / 2), round(center_y - box_height / 2), round(box_width), round(box_height)], confidence, class_id))
         if not candidates:
             return [], text_mask
-        indices = cv2.dnn.NMSBoxes([box for box, _, _ in candidates], [score for _, score, _ in candidates], score_threshold=0.40, nms_threshold=0.35)
+        indices = cv2.dnn.NMSBoxes([box for box, _, _ in candidates], [score for _, score, _ in candidates], score_threshold=detect_threshold, nms_threshold=nms_threshold)
         regions: list[dict[str, int | float]] = []
         for index in np.asarray(indices).reshape(-1):
             left, top, box_width, box_height = candidates[int(index)][0]

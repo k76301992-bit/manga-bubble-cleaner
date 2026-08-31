@@ -244,7 +244,7 @@ async function detectBubbleTextRegions(imageBuffer: Buffer, width: number, heigh
       model: EXTERNAL_QWEN_MODEL, temperature: 0, max_tokens: 1200, stream: false,
       messages: [{ role: "user", content: [
         { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBuffer.toString("base64")}` } },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${imageBuffer.toString("base64")}` } },
       ] }],
     }),
   };
@@ -414,7 +414,10 @@ export function inpaintDetectedTextBoxes(source: Buffer, width: number, height: 
       if (backgroundNeighbours >= 5) mask[(y - y0) * boxWidth + x - x0] = 1;
     }
     const expanded = new Uint8Array(mask);
-    for (let pass = 0; pass < (lightFill ? 0 : detectorMaskAvailable ? 0 : 2); pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
+    // Dilate the mask to cover anti-aliased glyph edges and text outlines
+    // that would otherwise leave visible ghost residues. 2 passes covers
+    // ~2px of edge artefacts without erasing bubble borders or artwork.
+    for (let pass = 0; pass < 2; pass += 1) { const next = new Uint8Array(expanded); for (let y = 1; y < boxHeight - 1; y += 1) for (let x = 1; x < boxWidth - 1; x += 1) if (expanded[y * boxWidth + x]) for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) next[(y + dy) * boxWidth + x + dx] = 1; expanded.set(next); }
     // Reconstruct from the local background for every bubble type. A fixed
     // white fill is only valid for neutral paper; on pink/transparent bubbles
     // it creates a visible rectangle even when the mask is text-only.
@@ -457,14 +460,16 @@ export function buildTrainedInpaintMask(source: Buffer, width: number, height: n
       const pixel = read(x, y);
       const brightDifference = Math.abs(brightness(pixel) - brightness(background));
       const segmentedText = detectorMaskAvailable && detectorTextMask![y * width + x] > 0;
-      const contrastsWithBackdrop = pixel[3] > 180 && (colorDistance(pixel, background) > 48 || brightDifference > 38);
+      const contrastsWithBackdrop = pixel[3] > 180 && (colorDistance(pixel, background) > 36 || brightDifference > 28);
       // When ONNX supplies a mask, never let a broad box erase a nearby face or artwork.
       // Without it, retain the conservative contrast fallback for remote/manual regions.
-      const likelyTextEdge = segmentedText && pixel[3] > 180 && (colorDistance(pixel, background) > 12 || brightDifference > 10);
+      const likelyTextEdge = segmentedText && pixel[3] > 180 && (colorDistance(pixel, background) > 8 || brightDifference > 6);
       if ((detectorMaskAvailable ? likelyTextEdge : contrastsWithBackdrop) && pixel[3] > 180) mask[y * width + x] = 255;
     }
   }
-  return expandBinaryMask(mask, width, height, detectorMaskAvailable ? 1 : 3);
+  // Expand the mask more to cover anti-aliased glyph edges and text outlines
+  // that Big-LaMa would otherwise leave as visible residue.
+  return expandBinaryMask(mask, width, height, detectorMaskAvailable ? 3 : 5);
 }
 
 function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: number, top: number, cropWidth: number, cropHeight: number) {
@@ -527,8 +532,9 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     const coreTop = tileIndex * profile.tileHeight; const coreHeight = Math.min(profile.tileHeight, height - coreTop);
     const top = Math.max(0, coreTop - TILE_OVERLAP); const bottom = Math.min(height, coreTop + coreHeight + TILE_OVERLAP); const currentHeight = bottom - top;
     const tileData = Buffer.from(decoded.subarray(top * rowBytes, bottom * rowBytes));
-    // Detection only: JPEG significantly reduces the remote request size while preserving tile coordinates.
-    const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).jpeg({ quality: 92, chromaSubsampling: "4:4:4" }).toBuffer();
+    // Detection input: PNG (not JPEG) because the external Qwen provider returns
+    // "[Qwen: empty response]" for JPEG payloads.
+    const visionInput = await sharp(tileData, { raw: { width, height: currentHeight, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer();
     await input.onTile?.({ tileIndex, tileCount, status: "detecting" });
     // The fallback also considers smooth coloured/gradient balloons. The learned detector remains the
     // primary source and is not gated by a white-background heuristic.
@@ -595,13 +601,20 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
         : uniqueRegions(local, profile.maxRegionsPerTile); detectedRegions += detected.length;
     const regions = uniqueRegions([...detected, ...manualRegionsForTile(input.maskAdjustments, width, height, top, currentHeight)], 48);
     await input.onTile?.({ tileIndex, tileCount, status: "cleaning" });
-    // Keep flat white balloons on the deterministic local path even in maximum-detail.
-    // If the learned detector/inpainting service is unavailable, this still produces a useful result.
-    const localRegions = !profile.useTrainedInpainting ? regions : regions.filter((region) => shouldUseLocalBubbleRepair(tileData, width, currentHeight, region));
-    const trainedRegions = profile.useTrainedInpainting ? regions.filter((region) => !shouldUseLocalBubbleRepair(tileData, width, currentHeight, region)) : [];
+    // Send ALL regions to the trained Big-LaMa model for intelligent inpainting.
+    // The previous split (white bubbles → local fill, coloured → Big-LaMa) caused
+    // visible white rectangles on white bubbles because inpaintDetectedTextBoxes
+    // uses a flat fill, not a learned repair. Big-LaMa reconstructs the bubble
+    // background properly for every bubble type. The local path is kept only as
+    // a fallback when Big-LaMa is unavailable or the region is genuinely flat white.
+    const useTrained = profile.useTrainedInpainting;
+    const localRegions = !useTrained ? regions : [];
+    const trainedRegions = useTrained ? regions : [];
     const trained = trainedRegions.length ? await inpaintWithTrainedModel(tileData, width, currentHeight, trainedRegions, safeComicTextMask) : undefined;
     const trainedOutput = trained?.repairedRegions ? trained.output : tileData;
-    const repairedRaw = inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, localRegions, safeComicTextMask);
+    // Only run the local fill on regions Big-LaMa did NOT repair (fallback).
+    const fallbackRegions = trained?.repairedRegions ? localRegions.filter((region) => !trained.repairedRegions || !trainedRegions.includes(region)) : localRegions;
+    const repairedRaw = fallbackRegions.length ? inpaintDetectedTextBoxes(trainedOutput, width, currentHeight, fallbackRegions, safeComicTextMask) : trainedOutput;
     trainedInpaintRegions += trained?.repairedRegions ?? 0;
     const sourceStart = (coreTop - top) * rowBytes;
     repairedRaw.copy(output, coreTop * rowBytes, sourceStart, sourceStart + coreHeight * rowBytes);
