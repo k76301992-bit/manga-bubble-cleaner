@@ -531,8 +531,29 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
   const decoded = await sharp(input.image).ensureAlpha().raw().toBuffer();
   const output = Buffer.from(decoded);
   const rowBytes = width * 4;
-  const tileCount = Math.ceil(height / profile.tileHeight); let detectedRegions = 0; let remoteDetectionTiles = 0; let trainedInpaintRegions = 0;   let remoteDetectionUnavailable = false;
+  const tileCount = Math.ceil(height / profile.tileHeight); let detectedRegions = 0; let remoteDetectionTiles = 0; let trainedInpaintRegions = 0;
+  let remoteDetectionUnavailable = false;
   let localDetectorUnavailable = false;
+
+  // ===== WHOLE-PAGE REMOTE DETECTION (Qwen) =====
+  // Run the external Qwen detector ONCE on the full page (not per tile).
+  // This avoids N separate API calls (one per tile) which multiply cost and
+  // frequently time out. Qwen's prompt already ignores SFX/panel borders.
+  let fullRemoteRegions: BubbleTextRegion[] = [];
+  if (profile.useRemoteWhenLocalMisses) {
+    await input.onTile?.({ tileIndex: 0, tileCount, status: "detecting" });
+    const fullPagePng = await sharp(decoded, { raw: { width, height, channels: 4 } }).png({ compressionLevel: 6 }).toBuffer();
+    console.info(`[cleaner] external detector start on FULL page (${width}x${height})`);
+    fullRemoteRegions = await detectBubbleTextRegions(fullPagePng, width, height, profile.requestTimeoutMs, profile.maxRegionsPerTile * Math.max(1, tileCount)).then((result) => {
+      console.info(`[cleaner] external detector finished full page: ${result.length} regions`);
+      remoteDetectionTiles = result.length ? 1 : 0;
+      return result;
+    }).catch((error) => {
+      console.warn("[cleaner] remote detection skipped for full page", error instanceof Error ? error.message : error);
+      remoteDetectionUnavailable = true;
+      return [] as BubbleTextRegion[];
+    });
+  }
 
   for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
     const coreTop = tileIndex * profile.tileHeight; const coreHeight = Math.min(profile.tileHeight, height - coreTop);
@@ -588,19 +609,16 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
       // one-pixel local dilation, never by enlarging this box.
       return [region];
     });
-    const shouldUseExternalDetector = profile.useRemoteWhenLocalMisses && (comicRegions === undefined || profile.useRemoteAlongsideLocal) && !remoteDetectionUnavailable;
-    if (shouldUseExternalDetector) console.info(`[cleaner] external detector start tile ${tileIndex + 1}/${tileCount}`);
-    const remote = shouldUseExternalDetector
-      ? await detectBubbleTextRegions(visionInput, width, currentHeight, profile.requestTimeoutMs, profile.maxRegionsPerTile).then((result) => {
-        console.info(`[cleaner] external detector finished tile ${tileIndex + 1}/${tileCount}: ${result.length} regions`);
-        return result;
-      }).catch((error) => {
-        console.warn("[cleaner] remote detection skipped for one tile", error instanceof Error ? error.message : error);
-        remoteDetectionUnavailable = true;
-        return [] as BubbleTextRegion[];
+    // Slice the full-page Qwen regions into this tile's coordinate space.
+    // Qwen ran once on the full page; we just project its regions per tile.
+    const remote = !remoteDetectionUnavailable && fullRemoteRegions.length
+      ? fullRemoteRegions.flatMap((region) => {
+        const tileTop = Math.max(region.y, top);
+        const tileBottom = Math.min(region.y + region.height, bottom);
+        if (tileBottom <= tileTop) return [];
+        return [{ x: region.x, y: tileTop - top, width: region.width, height: tileBottom - tileTop }];
       })
       : [];
-    if (remote.length) remoteDetectionTiles += 1;
     const detected = remote.length
       ? uniqueRegions([...remote, ...comicBubbleRegions, ...local], profile.maxRegionsPerTile)
       : comicBubbleRegions.length ? uniqueRegions([...comicBubbleRegions, ...local], profile.maxRegionsPerTile)
