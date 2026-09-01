@@ -44,7 +44,7 @@ async function startServer() {
     if (!job) return res.status(404).json({ error: "Job غير موجود." });
     return res.json(job);
   });
-  app.post("/api/v1/clean", express.raw({ type: [...supportedImageTypes], limit: "20mb" }), async (req, res) => {
+  app.post("/api/v1/clean", express.raw({ type: [...supportedImageTypes], limit: "50mb" }), async (req, res) => {
     if (!hasValidServiceKey(req.headers.authorization)) return res.status(401).json({ error: "مفتاح خدمة غير صالح." });
     const mimeType = (req.headers["content-type"] ?? "").split(";")[0].toLowerCase();
     const fileName = typeof req.headers["x-file-name"] === "string" ? req.headers["x-file-name"] : "manhwa-page";
@@ -59,7 +59,7 @@ async function startServer() {
     }
   });
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    if (typeof error === "object" && error && "type" in error && (error as { type?: string }).type === "entity.too.large") return res.status(413).json({ error: "الصورة تتجاوز حد 20 ميغابايت." });
+    if (typeof error === "object" && error && "type" in error && (error as { type?: string }).type === "entity.too.large") return res.status(413).json({ error: "الصورة تتجاوز حد 50 ميغابايت." });
     console.error(error); return res.status(500).json({ error: "خطأ غير متوقع في خادم المعالجة." });
   });
   const port = Number(process.env.PORT || 3000); app.listen(port, "0.0.0.0", () => { console.log(`[standalone-api] listening on ${port}`); startDiscordBot(); });

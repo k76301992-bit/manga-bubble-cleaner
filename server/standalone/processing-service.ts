@@ -4,7 +4,7 @@ import { cleanImageInMemory, type CleaningQuality, type ManualMaskAdjustment } f
 import { createProcessingJob, updateProcessingJob } from "./job-store";
 
 export const supportedImageTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
-export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 export const MAX_IMAGE_PIXELS = 20_000_000;
 
 let cleaningInProgress = false;
@@ -27,7 +27,7 @@ export async function processImageInMemory(input: {
   maskAdjustments?: ManualMaskAdjustment[];
 }) {
   if (!supportedImageTypes.has(input.mimeType) || !input.image.length) throw new ProcessingRequestError(400, "invalid-image", "أرسل ملف PNG أو JPG أو WebP صالحًا.");
-  if (input.image.length > MAX_IMAGE_BYTES) throw new ProcessingRequestError(413, "image-too-large", "الصورة تتجاوز حد 20 ميغابايت.");
+  if (input.image.length > MAX_IMAGE_BYTES) throw new ProcessingRequestError(413, "image-too-large", "الصورة تتجاوز حد 50 ميغابايت.");
   if (cleaningInProgress) throw new ProcessingRequestError(429, "server-busy", "الخادم يعالج صفحة أخرى الآن؛ أعد المحاولة بعد انتهائها.");
 
   let metadata: Metadata;

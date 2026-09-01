@@ -7,8 +7,8 @@ export type BatchImage = { name: string; mimeType: string; image: Buffer };
 export type CleanedBatchImage = { sourceName: string; outputName: string; image: Buffer };
 export const MAX_IMAGES_PER_BATCH = 12;
 export const MAX_ZIP_BYTES = 50 * 1024 * 1024;
-const MAX_UNCOMPRESSED_ZIP_BYTES = 150 * 1024 * 1024;
-const MAX_BATCH_INPUT_BYTES = 55 * 1024 * 1024;
+const MAX_UNCOMPRESSED_ZIP_BYTES = 400 * 1024 * 1024;
+const MAX_BATCH_INPUT_BYTES = 150 * 1024 * 1024;
 
 function releaseUnusedPageBuffers() {
   const collect = (globalThis as typeof globalThis & { gc?: () => void }).gc;
@@ -41,7 +41,7 @@ export function validateBatchImages(images: BatchImage[]) {
   let total = 0;
   for (const item of images) {
     if (!supportedImageTypes.has(item.mimeType)) throw new Error(`نوع الصورة غير مدعوم: ${item.name}`);
-    if (!item.image.length || item.image.length > MAX_IMAGE_BYTES) throw new Error(`الصورة ${item.name} تتجاوز حد 20 ميغابايت.`);
+    if (!item.image.length || item.image.length > MAX_IMAGE_BYTES) throw new Error(`الصورة ${item.name} تتجاوز حد 50 ميغابايت.`);
     total += item.image.length;
   }
   if (total > MAX_BATCH_INPUT_BYTES) throw new Error("إجمالي الصور يتجاوز حد الذاكرة الآمن للعملية الواحدة (55 ميغابايت).");

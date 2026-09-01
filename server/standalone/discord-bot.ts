@@ -5,6 +5,7 @@ import {
 } from "discord.js";
 import { type CleaningQuality } from "./cleaner";
 import { cleanBatchInMemory, createResultZip, extractImagesFromZip, MAX_IMAGES_PER_BATCH, MAX_ZIP_BYTES, mimeTypeForFileName, type BatchImage } from "./batch-processing";
+import { MAX_IMAGE_BYTES } from "./processing-service";
 import { createGoogleDriveResultFolder, readGoogleDriveSource } from "./google-drive";
 
 const V2_FLAG = MessageFlags.IsComponentsV2;
@@ -58,7 +59,7 @@ export function hasZipSignature(bytes: Buffer) {
 export function validateDiscordImageAttachment(attachment: DiscordAttachmentInput) {
   if (!isDiscordCdn(attachment.url)) return "يجب أن يكون الملف مرفقًا من Discord نفسه عبر HTTPS.";
   if (!mimeTypeForAttachment(attachment)) return "ارفع صور PNG أو JPG أو WebP فقط.";
-  if (!attachment.size || attachment.size > 20 * 1024 * 1024) return "يجب ألا تتجاوز الصورة 20 ميغابايت.";
+  if (!attachment.size || attachment.size > MAX_IMAGE_BYTES) return "يجب ألا تتجاوز الصورة 50 ميغابايت.";
   return undefined;
 }
 
