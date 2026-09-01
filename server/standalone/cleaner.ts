@@ -5,7 +5,7 @@ export type CleaningQuality = "balanced" | "preserve-detail" | "maximum-detail";
 export type BubbleTextRegion = { x: number; y: number; width: number; height: number };
 export type ManualMaskAdjustment = { mode: "include" | "exclude"; points: Array<{ x: number; y: number }> };
 
-const MAX_INPUT_BYTES = 20 * 1024 * 1024;
+const MAX_INPUT_BYTES = 50 * 1024 * 1024;
 const MAX_WIDTH = 12000;
 const MAX_HEIGHT = 30000;
 export const TILE_HEIGHT = 3200;
@@ -518,7 +518,7 @@ export function manualRegionsForTile(adjustments: ManualMaskAdjustment[] | undef
 
 export async function cleanImageInMemory(input: { image: Buffer; mimeType: string; quality: CleaningQuality; maskAdjustments?: ManualMaskAdjustment[]; onTile?: (info: { tileIndex: number; tileCount: number; status: "detecting" | "cleaning" }) => Promise<void> | void }) {
   if (!SUPPORTED_MIME_TYPES.has(input.mimeType)) throw new Error("يقبل الخادم صور PNG أو JPG أو WebP فقط.");
-  if (!input.image.length || input.image.length > MAX_INPUT_BYTES) throw new Error("يجب ألا تتجاوز الصورة 20 ميغابايت.");
+  if (!input.image.length || input.image.length > MAX_INPUT_BYTES) throw new Error("يجب ألا تتجاوز الصورة 50 ميغابايت.");
   const metadata = await sharp(input.image).metadata(); const width = metadata.width ?? 0; const height = metadata.height ?? 0;
   if (!width || !height || width > MAX_WIDTH || height > MAX_HEIGHT) throw new Error("أبعاد الصورة غير مدعومة.");
   const profile = cleaningProfileFor(input.quality);
