@@ -6,7 +6,11 @@ export type LocalComicTextRegion = { x: number; y: number; width: number; height
 export type LocalComicTextDetection = { regions: LocalComicTextRegion[]; textMask?: Buffer };
 
 export async function requestTrainedInpainting(image: Buffer, mask: Buffer) {
-  if (process.env.INFERENCE_ENABLED?.trim().toLowerCase() === "false") return undefined;
+  if (process.env.INFERENCE_ENABLED?.trim().toLowerCase() === "false") { console.warn("[inference] trained inpainting disabled by INFERENCE_ENABLED=false"); return undefined; }
+  const maskActive = mask.some((v) => v > 0);
+  if (!maskActive) { console.warn("[inference] trained inpainting skipped: empty mask"); return undefined; }
+  const activeMaskBytes = mask.filter((v) => v > 0).length;
+  console.info(`[inference] requesting inpaint: image=${image.length}B mask=${mask.length}B activeMask=${activeMaskBytes}`);
   try {
     const response = await fetch(`${inferenceUrl()}/v1/inpaint`, {
       method: "POST",
@@ -14,10 +18,16 @@ export async function requestTrainedInpainting(image: Buffer, mask: Buffer) {
       signal: AbortSignal.timeout(Number(process.env.INFERENCE_TIMEOUT_MS || 20_000)),
       body: JSON.stringify({ image: image.toString("base64"), mask: mask.toString("base64") }),
     });
-    if (!response.ok) throw new Error(`inference service returned ${response.status}`);
-    return { image: Buffer.from(await response.arrayBuffer()), elapsedMs: Number(response.headers.get("x-inference-time-ms") || 0) };
+    if (!response.ok) {
+      const body = await response.text();
+      console.warn(`[inference] inpaint failed: HTTP ${response.status} ${body.slice(0, 200)}`);
+      throw new Error(`inference service returned ${response.status}`);
+    }
+    const result = Buffer.from(await response.arrayBuffer());
+    console.info(`[inference] inpaint OK: result=${result.length}B elapsedMs=${response.headers.get("x-inference-time-ms")}`);
+    return { image: result, elapsedMs: Number(response.headers.get("x-inference-time-ms") || 0) };
   } catch (error) {
-    console.warn("[inference] trained inpainting skipped", error instanceof Error ? error.message : error);
+    console.warn("[inference] trained inpainting FAILED:", error instanceof Error ? error.message : error);
     return undefined;
   }
 }

@@ -467,9 +467,10 @@ export function buildTrainedInpaintMask(source: Buffer, width: number, height: n
       if ((detectorMaskAvailable ? likelyTextEdge : contrastsWithBackdrop) && pixel[3] > 180) mask[y * width + x] = 255;
     }
   }
-  // Expand the mask more to cover anti-aliased glyph edges and text outlines
-  // that Big-LaMa would otherwise leave as visible residue.
-  return expandBinaryMask(mask, width, height, detectorMaskAvailable ? 3 : 5);
+  // Expand the mask aggressively to cover anti-aliased glyph edges, text
+  // outlines, and faint shadows that Big-LaMa would otherwise leave as
+  // visible ghost residues. 6-8 passes covers ~6-8px of edge artefacts.
+  return expandBinaryMask(mask, width, height, detectorMaskAvailable ? 6 : 8);
 }
 
 function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: number, top: number, cropWidth: number, cropHeight: number) {
@@ -480,6 +481,8 @@ function cropRaw(source: Buffer, pageWidth: number, pageHeight: number, left: nu
 
 async function inpaintWithTrainedModel(source: Buffer, width: number, height: number, regions: BubbleTextRegion[], detectorTextMask?: Buffer) {
   let output = Buffer.from(source); const globalMask = buildTrainedInpaintMask(source, width, height, regions, detectorTextMask); let repairedRegions = 0;
+  const maskActiveTotal = globalMask.filter((v) => v > 0).length;
+  console.info(`[cleaner] inpaintWithTrainedModel: regions=${regions.length} maskActive=${maskActiveTotal}/${globalMask.length} detectorMask=${detectorTextMask ? detectorTextMask.length : "none"}`);
   for (const region of uniqueRegions(regions, 48)) {
     const padding = clamp(Math.round(Math.max(region.width, region.height) * 0.35), 32, 128);
     const left = clamp(region.x - padding, 0, width - 1); const top = clamp(region.y - padding, 0, height - 1);
@@ -487,10 +490,11 @@ async function inpaintWithTrainedModel(source: Buffer, width: number, height: nu
     const cropWidth = right - left; const cropHeight = bottom - top; const cropMask = Buffer.alloc(cropWidth * cropHeight);
     let hasMask = false;
     for (let y = 0; y < cropHeight; y += 1) { cropMask.set(globalMask.subarray((top + y) * width + left, (top + y) * width + right), y * cropWidth); hasMask ||= cropMask.subarray(y * cropWidth, (y + 1) * cropWidth).some((value) => value > 0); }
-    if (!hasMask) continue;
+    if (!hasMask) { console.info(`[cleaner] region ${region.x},${region.y} ${region.width}x${region.height}: NO MASK, skipped`); continue; }
+    const cropMaskActive = cropMask.filter((v) => v > 0).length;
     const cropImage = await sharp(cropRaw(output, width, height, left, top, cropWidth, cropHeight), { raw: { width: cropWidth, height: cropHeight, channels: 4 } }).png().toBuffer();
     const maskImage = await sharp(cropMask, { raw: { width: cropWidth, height: cropHeight, channels: 1 } }).png().toBuffer();
-    const trained = await requestTrainedInpainting(cropImage, maskImage); if (!trained) continue;
+    const trained = await requestTrainedInpainting(cropImage, maskImage); if (!trained) { console.info(`[cleaner] region ${region.x},${region.y} ${region.width}x${region.height}: inpaint FAILED (cropMask=${cropMaskActive})`); continue; }
     const trainedMetadata = await sharp(trained.image).metadata();
     if (trainedMetadata.width !== cropWidth || trainedMetadata.height !== cropHeight) {
       console.warn("[cleaner] discarded trained crop with unexpected dimensions", { expected: `${cropWidth}x${cropHeight}`, received: `${trainedMetadata.width ?? 0}x${trainedMetadata.height ?? 0}` });
@@ -503,7 +507,9 @@ async function inpaintWithTrainedModel(source: Buffer, width: number, height: nu
     }
     for (let y = 0; y < cropHeight; y += 1) for (let x = 0; x < cropWidth; x += 1) if (cropMask[y * cropWidth + x]) repaired.copy(output, ((top + y) * width + left + x) * 4, (y * cropWidth + x) * 4, (y * cropWidth + x + 1) * 4);
     repairedRegions += 1;
+    console.info(`[cleaner] region ${region.x},${region.y} ${region.width}x${region.height}: repaired OK (cropMask=${cropMaskActive})`);
   }
+  console.info(`[cleaner] inpaintWithTrainedModel done: ${repairedRegions}/${regions.length} regions repaired`);
   return { output, repairedRegions };
 }
 
