@@ -27,12 +27,18 @@ type CleaningProfile = {
   useRemoteAlongsideLocal: boolean;
   useTrainedInpainting: boolean;
   trainedOnly: boolean;
+  skipLocalDetector: boolean;
 };
 
 export function cleaningProfileFor(quality: CleaningQuality): CleaningProfile {
-  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useRemoteAlongsideLocal: false, useTrainedInpainting: false, trainedOnly: false };
-  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 180_000, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true };
-  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: false, useTrainedInpainting: true, trainedOnly: false };
+  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useRemoteAlongsideLocal: false, useTrainedInpainting: false, trainedOnly: false, skipLocalDetector: false };
+  // maximum-detail: Qwen is the authoritative detector on the full page.
+  // Skip the local ONNX detector entirely — it is slower, less accurate on
+  // large pages (HTTP 422 / fetch failed), and its empty mask made Big-LaMa
+  // skip every region. Qwen already returns tight text boxes for every
+  // bubble type, so the local detector adds no value here.
+  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 180_000, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true, skipLocalDetector: true };
+  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: false, useTrainedInpainting: true, trainedOnly: false, skipLocalDetector: false };
 }
 
 function colorDistance(a: Pixel, b: Pixel) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
@@ -451,7 +457,13 @@ function expandBinaryMask(mask: Uint8Array, width: number, height: number, passe
 export function buildTrainedInpaintMask(source: Buffer, width: number, height: number, regions: BubbleTextRegion[], detectorTextMask?: Buffer) {
   const mask = new Uint8Array(width * height);
   const read = (x: number, y: number): Pixel => { const o = (y * width + x) * 4; return [source[o], source[o + 1], source[o + 2], source[o + 3]]; };
-  const detectorMaskAvailable = detectorTextMask?.length === width * height;
+  const detectorMaskPresent = detectorTextMask?.length === width * height;
+  // A mask that exists but is all zeros (e.g. ONNX failed and returned an empty
+  // buffer) must be treated as unavailable. Otherwise the likelyTextEdge path
+  // (which requires detectorTextMask > 0) never fires, the mask stays empty,
+  // and Big-LaMa skips every region with "NO MASK".
+  const detectorMaskAvailable = detectorMaskPresent && detectorTextMask!.some((v) => v > 0);
+  if (detectorMaskPresent && !detectorMaskAvailable) console.warn("[cleaner] detector mask present but empty — falling back to contrast detection");
   for (const region of uniqueRegions(regions, 48)) {
     const background = regionBackground(source, width, height, region);
     const x0 = clamp(region.x, 1, width - 2); const y0 = clamp(region.y, 1, height - 2);
@@ -566,13 +578,15 @@ export async function cleanImageInMemory(input: { image: Buffer; mimeType: strin
     // The fallback also considers smooth coloured/gradient balloons. The learned detector remains the
     // primary source and is not gated by a white-background heuristic.
     const local = await detectFallbackDarkTextRegions(visionInput, width, currentHeight, true, profile.maxRegionsPerTile, false);
-    // Always run the local ONNX detector. Speed mode previously skipped it and
-    // relied only on the dark-ink fallback, which can collapse a long-strip page
-    // to a single detected balloon. Big-LaMa remains disabled in speed mode.
+    // Run the local ONNX detector only when the profile wants it. In maximum-detail
+    // it is skipped entirely (Qwen on the full page is authoritative). Skipping it
+    // also avoids the empty-mask bug where ONNX fails on large pages (fetch failed),
+    // returns an all-zero mask, and makes Big-LaMa skip every region.
     let comicDetection: Awaited<ReturnType<typeof requestLocalComicTextDetectionWithMask>>;
-    if (localDetectorUnavailable) {
+    if (profile.skipLocalDetector || localDetectorUnavailable) {
       comicDetection = undefined;
-      console.warn(`[cleaner] local detector disabled for tile ${tileIndex + 1}/${tileCount}; using external detector`);
+      if (profile.skipLocalDetector) console.info(`[cleaner] local detector skipped for tile ${tileIndex + 1}/${tileCount} (profile.skipLocalDetector)`);
+      else console.warn(`[cleaner] local detector disabled for tile ${tileIndex + 1}/${tileCount}; using external detector`);
     } else {
       try {
         comicDetection = await requestLocalComicTextDetectionWithMask(visionInput);
