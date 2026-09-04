@@ -31,14 +31,21 @@ type CleaningProfile = {
 };
 
 export function cleaningProfileFor(quality: CleaningQuality): CleaningProfile {
-  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: 25_000, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useRemoteAlongsideLocal: false, useTrainedInpainting: false, trainedOnly: false, skipLocalDetector: false };
+  // requestTimeoutMs is the Qwen full-page vision-call budget. Production
+  // (2026-09-04) logged a healthy full-page detection at 161s and a second one
+  // aborted at the 180s cap, so the default is now 300s and can be tuned via
+  // QWEN_REQUEST_TIMEOUT_MS without a rebuild. Qwen runs ONCE per page; a
+  // timeout here downgrades the whole job to the contrast-detection fallback.
+  const envQwenTimeoutMs = Number(process.env.QWEN_REQUEST_TIMEOUT_MS);
+  const qwenFullPageTimeoutMs = Number.isFinite(envQwenTimeoutMs) && envQwenTimeoutMs >= 30_000 ? envQwenTimeoutMs : 300_000;
+  if (quality === "balanced") return { tileHeight: 4000, requestTimeoutMs: qwenFullPageTimeoutMs, maxRegionsPerTile: 12, useRemoteWhenLocalMisses: false, useRemoteAlongsideLocal: false, useTrainedInpainting: false, trainedOnly: false, skipLocalDetector: false };
   // maximum-detail: Qwen is the authoritative detector on the full page.
   // Skip the local ONNX detector entirely — it is slower, less accurate on
   // large pages (HTTP 422 / fetch failed), and its empty mask made Big-LaMa
   // skip every region. Qwen already returns tight text boxes for every
   // bubble type, so the local detector adds no value here.
-  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: 180_000, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true, skipLocalDetector: true };
-  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: 12_000, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: false, useTrainedInpainting: true, trainedOnly: false, skipLocalDetector: false };
+  if (quality === "maximum-detail") return { tileHeight: 2400, requestTimeoutMs: qwenFullPageTimeoutMs, maxRegionsPerTile: 48, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: true, useTrainedInpainting: true, trainedOnly: true, skipLocalDetector: true };
+  return { tileHeight: TILE_HEIGHT, requestTimeoutMs: qwenFullPageTimeoutMs, maxRegionsPerTile: 24, useRemoteWhenLocalMisses: true, useRemoteAlongsideLocal: false, useTrainedInpainting: true, trainedOnly: false, skipLocalDetector: false };
 }
 
 function colorDistance(a: Pixel, b: Pixel) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }

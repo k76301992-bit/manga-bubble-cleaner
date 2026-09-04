@@ -14,6 +14,22 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Cap native thread pools BEFORE importing numpy/torch/cv2. Production
+# (Railway) containers advertise many host cores while the cgroup CPU quota is
+# a fraction of one core; unbounded OpenMP/MKL/OpenCV thread pools then thrash
+# the CPU so hard that even a 90x50 crop exceeded the 20s client timeout, and
+# the queued-up requests eventually memory-killed the process. One thread per
+# engine keeps latency predictable in exchange for negligible throughput loss
+# for this single-user sidecar (the engine locks already serialize requests).
+_NATIVE_THREADS = str(max(1, int(os.environ.get("INFERENCE_NUM_THREADS", "1"))))
+os.environ.setdefault("OMP_NUM_THREADS", _NATIVE_THREADS)
+os.environ.setdefault("MKL_NUM_THREADS", _NATIVE_THREADS)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", _NATIVE_THREADS)
+os.environ.setdefault("NUMEXPR_NUM_THREADS", _NATIVE_THREADS)
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _NATIVE_THREADS)
+os.environ.setdefault("TORCH_NUM_THREADS", _NATIVE_THREADS)
+os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")
+
 import numpy as np
 import cv2
 import torch
@@ -195,9 +211,62 @@ class ComicTextDetector:
         return sorted(regions, key=lambda region: (int(region["y"]), int(region["x"]))), round((time.monotonic() - started) * 1000), text_mask
 
 
+def _configure_native_threads() -> None:
+    """Runtime thread caps for libraries that decide parallelism at call time.
+    Complements the environment defaults set before import."""
+    torch_threads = max(1, int(os.environ.get("TORCH_NUM_THREADS", "1")))
+    interop_threads = max(1, int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1")))
+    try:
+        torch.set_num_threads(torch_threads)
+    except Exception as error:
+        print(f"[inference] torch.set_num_threads({torch_threads}) failed: {error}", flush=True)
+    try:
+        torch.set_num_interop_threads(interop_threads)
+    except Exception as error:
+        print(f"[inference] torch.set_num_interop_threads({interop_threads}) failed: {error}", flush=True)
+    try:
+        cv2.setNumThreads(torch_threads)
+    except Exception as error:
+        print(f"[inference] cv2.setNumThreads({torch_threads}) failed: {error}", flush=True)
+    try:
+        torch.set_flush_denormal(True)
+    except Exception:
+        pass
+
+
 engine = AnimeLamaEngine()
 text_detector = ComicTextDetector()
+_configure_native_threads()
 
+
+def _warm_up() -> None:
+    """Run one tiny inpaint and one tiny detection at startup.
+
+    The first real request otherwise pays lazy native-library initialisation,
+    which production observed as a 20s+ first-hit timeout even for a tiny
+    crop. Failures here are non-fatal: /health still reports real readiness."""
+    try:
+        canvas = np.full((64, 64, 3), 255, dtype=np.uint8)
+        canvas[24:40, 16:48] = 0
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        mask[24:40, 16:48] = 255
+        image_buffer = io.BytesIO()
+        Image.fromarray(canvas, "RGB").save(image_buffer, format="PNG")
+        mask_buffer = io.BytesIO()
+        Image.fromarray(mask, "L").save(mask_buffer, format="PNG")
+        _, elapsed_ms = engine.inpaint(image_buffer.getvalue(), mask_buffer.getvalue())
+        print(f"[inference] warm-up inpaint finished in {elapsed_ms}ms", flush=True)
+    except Exception as error:
+        print(f"[inference] warm-up inpaint failed (non-fatal): {error}", flush=True)
+    if text_detector.net is not None:
+        try:
+            page = np.full((256, 256, 3), 255, dtype=np.uint8)
+            page_buffer = io.BytesIO()
+            Image.fromarray(page, "RGB").save(page_buffer, format="PNG")
+            text_detector.detect(page_buffer.getvalue(), False)
+            print("[inference] warm-up detection finished", flush=True)
+        except Exception as error:
+            print(f"[inference] warm-up detection failed (non-fatal): {error}", flush=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -210,6 +279,7 @@ async def lifespan(_app: FastAPI):
             # Keep the process alive so /health exposes the real readiness state;
             # the production launcher will refuse to start Node until this is fixed.
             print(f"[inference] Comic text detector unavailable at startup: {error}", flush=True)
+    _warm_up()
     yield
 
 
